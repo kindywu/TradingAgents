@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>market</title>
+<style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 2rem 1rem; line-height: 1.6; color: #1a1a1a; background: #fff; }
+    h1 { border-bottom: 2px solid #0366d6; padding-bottom: .3em; }
+    h2 { border-bottom: 1px solid #eaecef; padding-bottom: .3em; margin-top: 2em; }
+    h3 { margin-top: 1.5em; }
+    code { background: #f6f8fa; padding: .2em .4em; border-radius: 3px; font-size: 90%; }
+    pre { background: #f6f8fa; padding: 1em; border-radius: 6px; overflow-x: auto; }
+    pre code { background: none; padding: 0; }
+    table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+    th, td { border: 1px solid #dfe2e5; padding: .5em .8em; text-align: left; }
+    th { background: #f6f8fa; }
+    blockquote { border-left: 4px solid #0366d6; color: #555; padding-left: 1em; margin: 1em 0; }
+    a { color: #0366d6; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .nav { margin-bottom: 1.5em; font-size: .9em; }
+    .nav a { padding: .2em .5em; }
+    .toc { background: #f6f8fa; padding: 1em 2em; border-radius: 6px; margin: 1.5em 0; }
+    .toc ul { padding-left: 1.5em; }
+    .toc li { margin: .3em 0; }
+
+</style>
+</head>
+<body>
+<p class="nav"><a href="../index.html">Back to Index</a></p>
+<article>
+<p>数据全部获取完毕！现在进行深入分析并撰写报告。</p>
+<hr />
+<h1>📊 03690.HK（美团）技术面深度分析报告</h1>
+<p><strong>分析日期：2026-05-11（最新交易日） | 当前价格：84.35 HKD</strong></p>
+<hr />
+<h2>一、选用的指标与选择逻辑</h2>
+<p>为了全面且无冗余地评估03690.HK的技术面，我精选了<strong>8个互补指标</strong>，覆盖趋势、动量、波动性和成交量四大维度：</p>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>指标</th>
+<th>选择理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>趋势</strong></td>
+<td>close_50_sma（50日均线）</td>
+<td>判断中期趋势方向，识别动态支撑/阻力</td>
+</tr>
+<tr>
+<td><strong>趋势</strong></td>
+<td>close_200_sma（200日均线）</td>
+<td>长期趋势基准，确认黄金/死亡交叉</td>
+</tr>
+<tr>
+<td><strong>动量</strong></td>
+<td>macd / macds / macdh</td>
+<td>全维度捕捉动量变化、交叉信号与动能强度</td>
+</tr>
+<tr>
+<td><strong>动量</strong></td>
+<td>rsi</td>
+<td>识别超买/超卖状态及背离信号</td>
+</tr>
+<tr>
+<td><strong>波动性</strong></td>
+<td>boll（20日均线中轨）</td>
+<td>动态基准线，判断价格相对位置</td>
+</tr>
+<tr>
+<td><strong>成交量</strong></td>
+<td>vwma</td>
+<td>成交量加权的均价，验证趋势可信度</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>二、技术指标详细解读</h2>
+<h3>1️⃣ 移动平均线：中期偏多，长期承压</h3>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th style="text-align: center;">最新值（05-11）</th>
+<th style="text-align: center;">趋势方向</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>50 SMA</strong></td>
+<td style="text-align: center;"><strong>82.16</strong></td>
+<td style="text-align: center;">缓慢下行（从91.14→82.16），下降斜率趋缓</td>
+</tr>
+<tr>
+<td><strong>200 SMA</strong></td>
+<td style="text-align: center;"><strong>98.75</strong></td>
+<td style="text-align: center;">稳步下行（从107.62→98.75），长期空头明确</td>
+</tr>
+<tr>
+<td><strong>价格 vs 50 SMA</strong></td>
+<td style="text-align: center;">84.35 &gt; 82.16 ✅</td>
+<td style="text-align: center;"><strong>价格站上50 SMA，中期偏多</strong></td>
+</tr>
+<tr>
+<td><strong>价格 vs 200 SMA</strong></td>
+<td style="text-align: center;">84.35 &lt; 98.75 ❌</td>
+<td style="text-align: center;"><strong>价格远低于200 SMA，长期空头</strong></td>
+</tr>
+<tr>
+<td><strong>50 SMA vs 200 SMA</strong></td>
+<td style="text-align: center;">82.16 &lt; 98.75 ❌</td>
+<td style="text-align: center;"><strong>死亡交叉持续，长期结构偏空</strong></td>
+</tr>
+</tbody>
+</table>
+<p>🔍 <strong>关键洞察</strong>：股价从4月初的80.25低点反弹后，于4月8日突破50 SMA（当时50 SMA在85.13附近），随后股价一度冲高至88.75。虽然当前价格略高于50 SMA，但50 SMA本身仍在下降，表明<strong>中期趋势尚处于筑底阶段，而非明确的上升趋势</strong>。200 SMA持续下行且价格远在其下方，说明<strong>长期空头格局未变</strong>。</p>
+<hr />
+<h3>2️⃣ MACD：动能由正转负，柱状图濒临零轴</h3>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th style="text-align: center;">最新值（05-11）</th>
+<th style="text-align: center;">趋势</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>MACD线</strong></td>
+<td style="text-align: center;"><strong>-0.063</strong></td>
+<td style="text-align: center;">从+1.22（04-17）持续回落，4月底跌破零轴</td>
+</tr>
+<tr>
+<td><strong>MACD信号线</strong></td>
+<td style="text-align: center;"><strong>-0.061</strong></td>
+<td style="text-align: center;">缓慢下行，4月从+0.85回落</td>
+</tr>
+<tr>
+<td><strong>MACD柱状图</strong></td>
+<td style="text-align: center;"><strong>-0.0018</strong></td>
+<td style="text-align: center;">接近零轴，空头动能极度衰减</td>
+</tr>
+</tbody>
+</table>
+<p>📉 <strong>演变历程</strong>：
+- <strong>3月中旬</strong>：MACD深度负值达-4.17，极度超卖
+- <strong>3月底至4月中</strong>：强劲反弹，MACD从-4.17飙升至+1.24，出现"黄金交叉"
+- <strong>4月下旬至今</strong>：动能消退，MACD回落至零轴以下，4月30日出现"死亡交叉"
+- <strong>当前</strong>：MACD线和信号线均在零轴下方且几乎重合，柱状图-0.0018趋近于零</p>
+<p>⚠️ <strong>关键判断</strong>：MACD柱状图从-0.44（04-30）收窄至-0.0018，显示<strong>空头动能正在急剧衰减</strong>。若未来几个交易日MACD线重新上穿信号线，将形成"零轴下方黄金交叉"——这是潜在的趋势反转信号，值得高度关注。</p>
+<hr />
+<h3>3️⃣ RSI：中性区域，无极端信号</h3>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th style="text-align: center;">最新值（05-11）</th>
+<th style="text-align: center;">区间</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>RSI</strong></td>
+<td style="text-align: center;"><strong>51.39</strong></td>
+<td style="text-align: center;">中性（30-70）</td>
+</tr>
+</tbody>
+</table>
+<p>📊 <strong>RSI历史路径</strong>：
+- 03-13：32.77（接近超卖，触发反弹）
+- 03-25：63.86（短期冲高）
+- 04-08：58.84（反弹高点）
+- 04-28：41.84（回落低点）
+- 05-11：51.39（回归中性）</p>
+<p>🔍 <strong>关键洞察</strong>：RSI从4月底的41.84回升至51.39，表明<strong>价格虽然横盘，但内部动能正在缓慢修复</strong>。没有超买/超卖信号，市场情绪相对平衡。RSI在50附近徘徊，等待方向性突破。</p>
+<hr />
+<h3>4️⃣ 布林带中轨（20 SMA）：价格围绕中轨盘整</h3>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th style="text-align: center;">最新值（05-11）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>布林带中轨</strong></td>
+<td style="text-align: center;"><strong>84.31</strong></td>
+</tr>
+<tr>
+<td><strong>收盘价 vs 中轨</strong></td>
+<td style="text-align: center;">84.35 ≈ 84.31 ✅</td>
+</tr>
+</tbody>
+</table>
+<p>📐 <strong>布林带形态</strong>：
+- 中轨从3月的79.85低点反弹至4月中的85.53高点，随后回落至84.31，<strong>中轨走平</strong>
+- 当前价格刚好在中轨附近，表明市场处于<strong>方向不明的盘整状态</strong>
+- 结合下轨支撑线（需额外数据），若价格能站稳中轨上方并向上轨推进，将是看多信号</p>
+<hr />
+<h3>5️⃣ VWMA：价格高于成交量加权均价，量能支撑尚可</h3>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th style="text-align: center;">最新值（05-11）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>VWMA（20日）</strong></td>
+<td style="text-align: center;"><strong>83.25</strong></td>
+</tr>
+<tr>
+<td><strong>收盘价 vs VWMA</strong></td>
+<td style="text-align: center;">84.35 &gt; 83.25 ✅</td>
+</tr>
+</tbody>
+</table>
+<p>📈 <strong>VWMA趋势</strong>：
+- 3月底低点：77.63
+- 4月中旬高点：86.19
+- 当前：83.25（持续高于价格低点）
+- VWMA从4月29日的84.83回落至83.25，显示<strong>近期成交量加权均价在走低</strong></p>
+<p>🔍 <strong>关键洞察</strong>：价格（84.35）略高于VWMA（83.25），说明近期的上涨有成交量的配合，但差距较小。VWMA的回落趋势表明<strong>资金流入意愿并不强烈</strong>，反弹的可持续性有待验证。</p>
+<hr />
+<h2>三、综合研判与交易策略</h2>
+<h3>📋 多空力量对比</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th style="text-align: center;">看多信号 ✅</th>
+<th style="text-align: center;">看空信号 ❌</th>
+<th style="text-align: center;">中性 🟡</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>趋势</strong></td>
+<td style="text-align: center;">价格 &gt; 50 SMA</td>
+<td style="text-align: center;">价格 &lt;&lt; 200 SMA，死叉持续</td>
+<td style="text-align: center;">50 SMA下行斜率放缓</td>
+</tr>
+<tr>
+<td><strong>动量</strong></td>
+<td style="text-align: center;">MACD柱状图收窄至零轴</td>
+<td style="text-align: center;">MACD零轴下方，线&lt;信号线</td>
+<td style="text-align: center;">MACD濒临交叉</td>
+</tr>
+<tr>
+<td><strong>情绪</strong></td>
+<td style="text-align: center;">RSI回升至51.39</td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;">RSI在中性区域</td>
+</tr>
+<tr>
+<td><strong>波动性</strong></td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;">价格紧贴布林带中轨</td>
+</tr>
+<tr>
+<td><strong>成交量</strong></td>
+<td style="text-align: center;">价格 &gt; VWMA</td>
+<td style="text-align: center;">VWMA趋势向下</td>
+<td style="text-align: center;">—</td>
+</tr>
+</tbody>
+</table>
+<h3>🎯 核心结论</h3>
+<p><strong>总体判断：HOLD（持有/观望）</strong></p>
+<p><strong>理由如下</strong>：</p>
+<ol>
+<li>
+<p><strong>中期反弹与长期下跌的矛盾</strong>：股价站上50 SMA是积极信号，但200 SMA持续压制，死叉格局未破。这是一个典型的"反弹vs反转"博弈阶段。</p>
+</li>
+<li>
+<p><strong>动能正在筑底</strong>：MACD柱状图极度逼近零轴，空头动能接近衰竭。若未来1-2周MACD线能上穿信号线形成零轴下方金叉，将构成<strong>趋势反转的早期信号</strong>。</p>
+</li>
+<li>
+<p><strong>方向选择在即</strong>：布林带中轨走平、RSI中性、MACD濒临交叉——所有信号都指向<strong>盘整末端，突破在即</strong>。</p>
+</li>
+<li>
+<p><strong>关键观察位</strong>：</p>
+</li>
+<li><strong>上行突破</strong>：若放量站上86-87区间（布林带上轨区域），则中期反弹有望延续至90-92</li>
+<li><strong>下行风险</strong>：若跌破50 SMA（约82.16）和80整数关口，则将重回探底之路</li>
+</ol>
+<h3>📌 具体策略建议</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: center;">交易者类型</th>
+<th style="text-align: left;">建议</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center;"><strong>短线交易者</strong></td>
+<td style="text-align: left;">观望为主。可等待MACD形成零轴下方金叉后轻仓试多，止损设在80以下</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>中线投资者</strong></td>
+<td style="text-align: left;">维持持有，不加仓。关注200 SMA（98.75）是否出现拐头迹象</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>长线投资者</strong></td>
+<td style="text-align: left;">当前估值处于相对低位，但技术面尚未确认底部。可分批建仓或继续等待右侧信号</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>四、关键数据汇总表</h2>
+<table>
+<thead>
+<tr>
+<th style="text-align: center;">指标</th>
+<th style="text-align: center;">当前值</th>
+<th style="text-align: center;">信号解读</th>
+<th style="text-align: center;">多空方向</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center;"><strong>收盘价</strong></td>
+<td style="text-align: center;">84.35 HKD</td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;">—</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>50 SMA</strong></td>
+<td style="text-align: center;">82.16</td>
+<td style="text-align: center;">价格在其上方，中期偏多</td>
+<td style="text-align: center;">✅ 偏多</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>200 SMA</strong></td>
+<td style="text-align: center;">98.75</td>
+<td style="text-align: center;">价格远在其下方，长期空头</td>
+<td style="text-align: center;">❌ 偏空</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>50/200关系</strong></td>
+<td style="text-align: center;">死叉中</td>
+<td style="text-align: center;">长期下行结构未改变</td>
+<td style="text-align: center;">❌ 偏空</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>MACD</strong></td>
+<td style="text-align: center;">-0.063</td>
+<td style="text-align: center;">零轴下方，柱状图濒临零轴</td>
+<td style="text-align: center;">🟡 中性偏多</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>MACDS</strong></td>
+<td style="text-align: center;">-0.061</td>
+<td style="text-align: center;">略高于MACD线，死叉持续</td>
+<td style="text-align: center;">🟡 中性</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>MACDH</strong></td>
+<td style="text-align: center;">-0.0018</td>
+<td style="text-align: center;">极度接近零轴，空头动能衰竭</td>
+<td style="text-align: center;">✅ 偏多</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>RSI(14)</strong></td>
+<td style="text-align: center;">51.39</td>
+<td style="text-align: center;">中性区域，无极端情绪</td>
+<td style="text-align: center;">🟡 中性</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>布林带中轨</strong></td>
+<td style="text-align: center;">84.31</td>
+<td style="text-align: center;">价格紧贴中轨，方向不明</td>
+<td style="text-align: center;">🟡 中性</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>VWMA</strong></td>
+<td style="text-align: center;">83.25</td>
+<td style="text-align: center;">价格高于VWMA，量能尚可</td>
+<td style="text-align: center;">✅ 偏多</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<blockquote>
+<p>⚠️ <strong>风险提示</strong>：本分析基于技术面指标，不构成投资建议。市场存在不确定性，请结合基本面分析及个人风险承受能力做出决策。尤其在当前盘整末端，可能出现剧烈波动，建议设置合理的止损/止盈位。</p>
+</blockquote>
+<p><strong>FINAL TRANSACTION PROPOSAL: HOLD</strong></p>
+</article>
+</body>
+</html>

@@ -1,5 +1,6 @@
 from typing import Optional
 import datetime
+import markdown
 import typer
 from pathlib import Path
 from functools import wraps
@@ -638,31 +639,130 @@ def get_analysis_date():
             )
 
 
+_HTML_CSS = """\
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 2rem 1rem; line-height: 1.6; color: #1a1a1a; background: #fff; }
+    h1 { border-bottom: 2px solid #0366d6; padding-bottom: .3em; }
+    h2 { border-bottom: 1px solid #eaecef; padding-bottom: .3em; margin-top: 2em; }
+    h3 { margin-top: 1.5em; }
+    code { background: #f6f8fa; padding: .2em .4em; border-radius: 3px; font-size: 90%; }
+    pre { background: #f6f8fa; padding: 1em; border-radius: 6px; overflow-x: auto; }
+    pre code { background: none; padding: 0; }
+    table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+    th, td { border: 1px solid #dfe2e5; padding: .5em .8em; text-align: left; }
+    th { background: #f6f8fa; }
+    blockquote { border-left: 4px solid #0366d6; color: #555; padding-left: 1em; margin: 1em 0; }
+    a { color: #0366d6; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .nav { margin-bottom: 1.5em; font-size: .9em; }
+    .nav a { padding: .2em .5em; }
+    .toc { background: #f6f8fa; padding: 1em 2em; border-radius: 6px; margin: 1.5em 0; }
+    .toc ul { padding-left: 1.5em; }
+    .toc li { margin: .3em 0; }
+"""
+
+def _md_to_html(md_text: str, title: str = "", back_link: str | None = None) -> str:
+    """Convert markdown text to a self-contained HTML page."""
+    body = markdown.markdown(md_text, extensions=["tables", "fenced_code"])
+    nav = f'<p class="nav"><a href="{back_link}">Back to Index</a></p>' if back_link else ""
+    return f"""\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+{_HTML_CSS}
+</style>
+</head>
+<body>
+{nav}
+<article>
+{body}
+</article>
+</body>
+</html>"""
+
+
+def _generate_index_html(save_path: Path, ticker: str, file_map: dict[str, list[tuple[str, str, str]]]) -> None:
+    """Generate index.html with relative-path links to all report sections.
+
+    file_map: {section_name: [(label, md_filename, html_filename), ...]}
+    """
+    toc_items = []
+    for section_name, files in file_map.items():
+        toc_items.append(f'<h3>{section_name}</h3>')
+        toc_items.append('<ul>')
+        for label, md_file, html_file in files:
+            toc_items.append(f'<li><a href="{html_file}">{label}</a> (<a href="{md_file}">md</a>)</li>')
+        toc_items.append('</ul>')
+
+    body = f"""\
+<h1>Trading Analysis Report: {ticker}</h1>
+<p>Generated: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+<div class="toc">
+<h2>Contents</h2>
+{"".join(toc_items)}
+</div>
+"""
+    html = f"""\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trading Analysis Report: {ticker}</title>
+<style>
+{_HTML_CSS}
+</style>
+</head>
+<body>
+{body}
+</body>
+</html>"""
+    (save_path / "index.html").write_text(html, encoding="utf-8")
+
+
+def _write_md_and_html(dir_path: Path, name: str, text: str, back_link: str = "../index.html") -> tuple[str, str]:
+    """Write .md and .html files, return (md_rel_path, html_rel_path) relative to save_path."""
+    dir_path.mkdir(exist_ok=True)
+    (dir_path / f"{name}.md").write_text(text, encoding="utf-8")
+    html = _md_to_html(text, title=name, back_link=back_link)
+    (dir_path / f"{name}.html").write_text(html, encoding="utf-8")
+
+
 def save_report_to_disk(final_state, ticker: str, save_path: Path):
-    """Save complete analysis report to disk with organized subfolders."""
+    """Save complete analysis report to disk with organized subfolders.
+
+    Generates both .md and .html files, plus an index.html at the root
+    that links to all sections via relative paths.
+    """
     save_path.mkdir(parents=True, exist_ok=True)
     sections = []
+    file_map = {}  # {section_name: [(label, md_rel, html_rel), ...]}
 
     # 1. Analysts
     analysts_dir = save_path / "1_analysts"
     analyst_parts = []
+    analyst_files = []
     if final_state.get("market_report"):
-        analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "market.md").write_text(final_state["market_report"], encoding="utf-8")
+        _write_md_and_html(analysts_dir, "market", final_state["market_report"])
+        analyst_files.append(("Market Analyst", "1_analysts/market.md", "1_analysts/market.html"))
         analyst_parts.append(("Market Analyst", final_state["market_report"]))
     if final_state.get("sentiment_report"):
-        analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "sentiment.md").write_text(final_state["sentiment_report"], encoding="utf-8")
+        _write_md_and_html(analysts_dir, "sentiment", final_state["sentiment_report"])
+        analyst_files.append(("Social Analyst", "1_analysts/sentiment.md", "1_analysts/sentiment.html"))
         analyst_parts.append(("Social Analyst", final_state["sentiment_report"]))
     if final_state.get("news_report"):
-        analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "news.md").write_text(final_state["news_report"], encoding="utf-8")
+        _write_md_and_html(analysts_dir, "news", final_state["news_report"])
+        analyst_files.append(("News Analyst", "1_analysts/news.md", "1_analysts/news.html"))
         analyst_parts.append(("News Analyst", final_state["news_report"]))
     if final_state.get("fundamentals_report"):
-        analysts_dir.mkdir(exist_ok=True)
-        (analysts_dir / "fundamentals.md").write_text(final_state["fundamentals_report"], encoding="utf-8")
+        _write_md_and_html(analysts_dir, "fundamentals", final_state["fundamentals_report"])
+        analyst_files.append(("Fundamentals Analyst", "1_analysts/fundamentals.md", "1_analysts/fundamentals.html"))
         analyst_parts.append(("Fundamentals Analyst", final_state["fundamentals_report"]))
     if analyst_parts:
+        file_map["I. Analyst Team Reports"] = analyst_files
         content = "\n\n".join(f"### {name}\n{text}" for name, text in analyst_parts)
         sections.append(f"## I. Analyst Team Reports\n\n{content}")
 
@@ -671,27 +771,29 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
         research_dir = save_path / "2_research"
         debate = final_state["investment_debate_state"]
         research_parts = []
+        research_files = []
         if debate.get("bull_history"):
-            research_dir.mkdir(exist_ok=True)
-            (research_dir / "bull.md").write_text(debate["bull_history"], encoding="utf-8")
+            _write_md_and_html(research_dir, "bull", debate["bull_history"])
+            research_files.append(("Bull Researcher", "2_research/bull.md", "2_research/bull.html"))
             research_parts.append(("Bull Researcher", debate["bull_history"]))
         if debate.get("bear_history"):
-            research_dir.mkdir(exist_ok=True)
-            (research_dir / "bear.md").write_text(debate["bear_history"], encoding="utf-8")
+            _write_md_and_html(research_dir, "bear", debate["bear_history"])
+            research_files.append(("Bear Researcher", "2_research/bear.md", "2_research/bear.html"))
             research_parts.append(("Bear Researcher", debate["bear_history"]))
         if debate.get("judge_decision"):
-            research_dir.mkdir(exist_ok=True)
-            (research_dir / "manager.md").write_text(debate["judge_decision"], encoding="utf-8")
+            _write_md_and_html(research_dir, "manager", debate["judge_decision"])
+            research_files.append(("Research Manager", "2_research/manager.md", "2_research/manager.html"))
             research_parts.append(("Research Manager", debate["judge_decision"]))
         if research_parts:
+            file_map["II. Research Team Decision"] = research_files
             content = "\n\n".join(f"### {name}\n{text}" for name, text in research_parts)
             sections.append(f"## II. Research Team Decision\n\n{content}")
 
     # 3. Trading
     if final_state.get("trader_investment_plan"):
         trading_dir = save_path / "3_trading"
-        trading_dir.mkdir(exist_ok=True)
-        (trading_dir / "trader.md").write_text(final_state["trader_investment_plan"], encoding="utf-8")
+        _write_md_and_html(trading_dir, "trader", final_state["trader_investment_plan"])
+        file_map["III. Trading Team Plan"] = [("Trader", "3_trading/trader.md", "3_trading/trader.html")]
         sections.append(f"## III. Trading Team Plan\n\n### Trader\n{final_state['trader_investment_plan']}")
 
     # 4. Risk Management
@@ -699,32 +801,40 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
         risk_dir = save_path / "4_risk"
         risk = final_state["risk_debate_state"]
         risk_parts = []
+        risk_files = []
         if risk.get("aggressive_history"):
-            risk_dir.mkdir(exist_ok=True)
-            (risk_dir / "aggressive.md").write_text(risk["aggressive_history"], encoding="utf-8")
+            _write_md_and_html(risk_dir, "aggressive", risk["aggressive_history"])
+            risk_files.append(("Aggressive Analyst", "4_risk/aggressive.md", "4_risk/aggressive.html"))
             risk_parts.append(("Aggressive Analyst", risk["aggressive_history"]))
         if risk.get("conservative_history"):
-            risk_dir.mkdir(exist_ok=True)
-            (risk_dir / "conservative.md").write_text(risk["conservative_history"], encoding="utf-8")
+            _write_md_and_html(risk_dir, "conservative", risk["conservative_history"])
+            risk_files.append(("Conservative Analyst", "4_risk/conservative.md", "4_risk/conservative.html"))
             risk_parts.append(("Conservative Analyst", risk["conservative_history"]))
         if risk.get("neutral_history"):
-            risk_dir.mkdir(exist_ok=True)
-            (risk_dir / "neutral.md").write_text(risk["neutral_history"], encoding="utf-8")
+            _write_md_and_html(risk_dir, "neutral", risk["neutral_history"])
+            risk_files.append(("Neutral Analyst", "4_risk/neutral.md", "4_risk/neutral.html"))
             risk_parts.append(("Neutral Analyst", risk["neutral_history"]))
         if risk_parts:
+            file_map["IV. Risk Management Team Decision"] = risk_files
             content = "\n\n".join(f"### {name}\n{text}" for name, text in risk_parts)
             sections.append(f"## IV. Risk Management Team Decision\n\n{content}")
 
         # 5. Portfolio Manager
         if risk.get("judge_decision"):
             portfolio_dir = save_path / "5_portfolio"
-            portfolio_dir.mkdir(exist_ok=True)
-            (portfolio_dir / "decision.md").write_text(risk["judge_decision"], encoding="utf-8")
+            _write_md_and_html(portfolio_dir, "decision", risk["judge_decision"])
+            file_map["V. Portfolio Manager Decision"] = [("Portfolio Manager", "5_portfolio/decision.md", "5_portfolio/decision.html")]
             sections.append(f"## V. Portfolio Manager Decision\n\n### Portfolio Manager\n{risk['judge_decision']}")
 
     # Write consolidated report
     header = f"# Trading Analysis Report: {ticker}\n\nGenerated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-    (save_path / "complete_report.md").write_text(header + "\n\n".join(sections), encoding="utf-8")
+    full_text = header + "\n\n".join(sections)
+    (save_path / "complete_report.md").write_text(full_text, encoding="utf-8")
+    (save_path / "complete_report.html").write_text(_md_to_html(full_text, title=f"Report: {ticker}", back_link="index.html"), encoding="utf-8")
+
+    # Generate index.html
+    _generate_index_html(save_path, ticker, file_map)
+
     return save_path / "complete_report.md"
 
 
