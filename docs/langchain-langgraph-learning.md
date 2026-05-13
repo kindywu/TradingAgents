@@ -1,439 +1,870 @@
-# LangChain & LangGraph 入门学习指南
+# LangChain & LangGraph 深入浅出教程
 
-本文档聚焦 TradingAgents 项目实际用到的 LangChain/LangGraph 技术点，帮助你快速理解核心概念及其在本项目中的用法。
+本教程面向零基础读者，从"为什么"开始，逐步深入到"怎么做"，用最简短的代码讲清楚每个概念。
 
 ---
 
 ## 目录
 
-1. [核心概念速览](#核心概念速览)
-2. [LangGraph：构建 Agent 工作流](#langgraph构建-agent-工作流)
-3. [LangChain：LLM 调用与工具绑定](#langchainllm-调用与工具绑定)
-4. [本项目实战模式](#本项目实战模式)
+1. [为什么要用 LangChain？](#为什么要用-langchain)
+2. [LangChain 基础：LLM 调用三板斧](#langchain-基础llm-调用三板斧)
+3. [LCEL：用管道串联你的逻辑](#lcel用管道串联你的逻辑)
+4. [Tool Calling：让 LLM 能动手做事](#tool-calling让-llm-能动手做事)
+5. [Structured Output：让 LLM 输出格式化数据](#structured-output让-llm-输出格式化数据)
+6. [为什么要用 LangGraph？](#为什么要用-langgraph)
+7. [LangGraph 基础：有状态图](#langgraph-基础有状态图)
+8. [MessagesState：消息累加器](#messagesstate消息累加器)
+9. [条件边：动态路由](#条件边动态路由)
+10. [Agent 工具循环](#agent-工具循环)
+11. [多 Agent 协作](#多-agent-协作)
+12. [断点续跑](#断点续跑)
+13. [完整实战：构建一个股票分析 Agent](#完整实战构建一个股票分析-agent)
 
 ---
 
-## 核心概念速览
+## 为什么要用 LangChain？
 
-| 技术 | 来源 | 作用 | 本项目中的位置 |
-|------|------|------|---------------|
-| `StateGraph` | LangGraph | 定义工作流图（节点 + 边） | `tradingagents/graph/setup.py` |
-| `MessagesState` | LangGraph | 带消息累加器的状态基类 | `tradingagents/agents/utils/agent_states.py` |
-| `ToolNode` | LangGraph | 把工具函数包装成图节点 | `tradingagents/graph/trading_graph.py` |
-| `add_conditional_edges` | LangGraph | 条件路由（if-else 分支） | `tradingagents/graph/setup.py` |
-| `SqliteSaver` | LangGraph | 断点续跑（崩溃恢复） | `tradingagents/graph/checkpointer.py` |
-| `ChatPromptTemplate` | LangChain | 模板化 prompt 构造 | `tradingagents/agents/analysts/` |
-| `llm.bind_tools()` | LangChain | 让 LLM 能调用工具 | `tradingagents/agents/analysts/` |
-| `llm.with_structured_output()` | LangChain | 让 LLM 输出结构化 JSON | `tradingagents/agents/utils/structured.py` |
-| `@tool` 装饰器 | LangChain | 定义 LLM 可调用的工具函数 | `tradingagents/dataflows/core_stock_tools.py` |
-
----
-
-## LangGraph：构建 Agent 工作流
-
-LangGraph 是一个**有状态图**框架。你把工作流定义成一张图（节点 = 步骤，边 = 流转方向），然后编译、运行。LangGraph 自动管理状态在各个节点间的传递和更新。
-
-### 2.1 StateGraph — 定义图
+直接用原生 SDK 调用 LLM 其实很简单：
 
 ```python
-from langgraph.graph import END, START, StateGraph
-from tradingagents.agents.utils.agent_states import AgentState
-
-workflow = StateGraph(AgentState)
-```
-
-`StateGraph(AgentState)` 创建一张图，`AgentState` 定义了图中流转的数据结构。
-
-### 2.2 添加节点
-
-```python
-workflow.add_node("Market Analyst", market_analyst_node)
-workflow.add_node("tools_market", ToolNode([get_stock_data, get_indicators]))
-```
-
-每个节点是一个**函数**，签名为 `(state: AgentState) -> dict`。输入当前状态，返回一个 dict（部分状态更新），LangGraph 会自动合并到全局状态中。
-
-本项目中的节点函数都是**工厂函数**生成的闭包：
-
-```python
-# tradingagents/agents/analysts/market_analyst.py
-def create_market_analyst(llm):
-    def market_analyst_node(state: AgentState) -> dict:
-        # 使用闭包捕获的 llm 进行推理
-        ...
-        return {"messages": [result], "market_report": report}
-    return market_analyst_node
-```
-
-LLM 实例通过闭包注入，而不是通过 state 传递。这是 LangGraph 的推荐模式。
-
-### 2.3 添加边 — 定义流转
-
-**静态边**（固定流转）：
-
-```python
-workflow.add_edge(START, "Market Analyst")           # 入口
-workflow.add_edge("tools_market", "Market Analyst")  # 工具执行完回到分析师
-workflow.add_edge("Portfolio Manager", END)          # 终点
-```
-
-`START` 和 `END` 是 LangGraph 的哨兵值，分别代表图的入口和出口。
-
-**条件边**（动态路由）：
-
-```python
-workflow.add_conditional_edges(
-    "Market Analyst",       # 源节点
-    should_continue_market,  # 路由函数
-    {
-        "tools_market": "tools_market",     # 返回值 → 目标节点
-        "Msg Clear Market": "Msg Clear Market",
-    }
+from openai import OpenAI
+client = OpenAI()
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": "你好"}],
 )
+print(response.choices[0].message.content)
 ```
 
-路由函数是纯 Python 函数，签名为 `(state: AgentState) -> str`，返回值为下一个节点名：
+**但当你要做这些事情时，代码会迅速膨胀：**
+
+- 管理多轮对话历史（手动拼接 messages 列表）
+- 切换模型提供商（OpenAI → Anthropic → 国产模型，API 各不相同）
+- 让 LLM 调用工具（解析 function call、执行函数、把结果塞回对话）
+- 构建复杂的 prompt（模板复用、变量插值、对话历史注入）
+
+LangChain 做的事情很简单：**把 LLM 开发中的重复模式抽象成标准接口**。它不"重"，核心代码量很小。
+
+> 一句话：LangChain 是 LLM 应用的"标准库"，让你换模型、调工具、管对话不用每次都重复造轮子。
+
+---
+
+## LangChain 基础：LLM 调用三板斧
+
+### 第一板：统一调用接口
+
+无论底层是 OpenAI、Anthropic 还是国产模型，调用方式都一样：
 
 ```python
-# tradingagents/graph/conditional_logic.py
-def should_continue_market(self, state: AgentState) -> str:
-    last_message = state["messages"][-1]
-    if last_message.tool_calls:
-        return "tools_market"       # LLM 要调工具 → 去执行工具
-    return "Msg Clear Market"       # LLM 给出最终回复 → 进入下一阶段
+from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+
+# 两个模型，用法完全一致
+llm_openai = ChatOpenAI(model="gpt-4o")
+llm_claude = ChatAnthropic(model="claude-sonnet-4-6")
+
+# 统一调用
+result = llm_openai.invoke("你好")       # → AIMessage(content="你好！有什么可以帮你的？")
+result = llm_claude.invoke("你好")       # → AIMessage(content="你好！请问...")
 ```
 
-### 2.4 MessagesState — 消息累加器
+所有 LLM 返回的都是统一的 `AIMessage` 对象，而不是各自厂商的原始响应格式。
 
-这是 LangGraph 最重要的内置类型之一：
+### 第二板：消息类型
+
+LangChain 用三种消息对象管理对话：
+
+```python
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+
+messages = [
+    SystemMessage(content="你是一个幽默的助手"),
+    HumanMessage(content="讲个笑话"),
+]
+response = llm.invoke(messages)  # 返回 AIMessage
+
+# 多轮对话就是不断往列表追加
+messages.append(response)                      # 追加 AI 回复
+messages.append(HumanMessage(content="再来一个"))  # 追加用户消息
+response = llm.invoke(messages)
+```
+
+`SystemMessage` = 系统指令，`HumanMessage` = 用户说的话，`AIMessage` = LLM 的回复。
+
+### 第三板：Prompt 模板
+
+```python
+from langchain_core.prompts import ChatPromptTemplate
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "你是一个{role}，用{language}回答"),
+    ("human", "{question}"),
+])
+
+# 模板 + LLM 组合
+chain = prompt | llm
+result = chain.invoke({
+    "role": "股票分析师",
+    "language": "中文",
+    "question": "介绍一下价值投资的核心思想",
+})
+# result.content → 一段中文回复
+
+# 换个角色，复用同一个模板
+result = chain.invoke({
+    "role": "幼儿园老师",
+    "language": "中文",
+    "question": "什么是月亮？",
+})
+```
+
+`{变量}` 语法让 prompt 像函数一样可复用。`|` 是 LCEL 管道符，把 prompt 输出传给 LLM。
+
+---
+
+## LCEL：用管道串联你的逻辑
+
+LCEL（LangChain Expression Language）是 LangChain 的核心范式。它的语法就一个操作符：`|`（管道符）。
+
+### 基本思想
+
+```python
+chain = step1 | step2 | step3
+result = chain.invoke(data)
+```
+
+数据从左到右流动，每一步的输出是下一步的输入。很像 Unix 管道 `cat file | grep | sort`。
+
+### 实际示例
+
+```python
+from langchain_core.output_parsers import StrOutputParser
+
+# 三件套：模板 → LLM → 字符串解析
+chain = prompt | llm | StrOutputParser()
+
+# 等价于：
+# 1. prompt.invoke({...}) → 拼好 messages
+# 2. llm.invoke(messages) → AIMessage
+# 3. StrOutputParser().invoke(aimsg) → 纯文本字符串
+
+result = chain.invoke({"topic": "Python"})
+# result 是 str，不是 AIMessage。StrOutputParser 自动提取了 .content
+```
+
+### 链式分支
+
+```python
+# 两个 prompt 各自生成内容，LLM 一次性处理
+chain = (
+    {
+        "context": retriever | format_docs,  # 检索 + 格式化
+        "question": lambda x: x["question"], # 透传问题
+    }
+    | prompt
+    | llm
+)
+chain.invoke({"question": "什么是 RAG？"})
+```
+
+`{...}` 是一个 RunnableDict，里面的 key 可以各自独立处理，最后合并成一个 dict 传给 prompt。
+
+> 一句话：LCEL 让你用 `|` 把 LLM 调用串成流水线，告别手写胶水代码。
+
+---
+
+## Tool Calling：让 LLM 能动手做事
+
+LLM 本质上只能"说话"，不能查数据库、调 API、读文件。Tool Calling（函数调用）解决了这个问题：**LLM 告诉你它想调什么函数、传什么参数，由你（或框架）执行，然后把结果传回去。**
+
+### 定义工具
+
+```python
+from langchain_core.tools import tool
+
+@tool
+def get_weather(city: str) -> str:
+    """获取指定城市的天气信息。"""
+    # 实际项目中调天气 API，这里模拟
+    return f"{city}今天晴天，25°C"
+
+@tool
+def calculate(expression: str) -> str:
+    """计算数学表达式。例如: '2+3*4'"""
+    return str(eval(expression))  # 仅示例，生产环境请用安全求值
+```
+
+`@tool` 装饰器从**函数签名**和**docstring**自动提取工具名、描述和参数 schema。这些信息会传给 LLM，让 LLM 知道有哪些工具可用、什么时候调用。
+
+### 绑定工具到 LLM
+
+```python
+tools = [get_weather, calculate]
+llm_with_tools = llm.bind_tools(tools)
+
+# LLM 自动判断：回答问题需要工具吗？
+result = llm_with_tools.invoke("北京今天天气怎么样？")
+# result.tool_calls → [{"name": "get_weather", "args": {"city": "北京"}, "id": "call_1"}]
+# result.content → ""（调用了工具，没有文字回复）
+
+result = llm_with_tools.invoke("你好呀")
+# result.tool_calls → []（不需要工具，直接回复）
+# result.content → "你好！有什么可以帮你的？"
+```
+
+### 执行工具并返回结果
+
+```python
+# 1. LLM 决定调用 get_weather
+ai_msg = llm_with_tools.invoke("北京天气？")
+
+# 2. 执行工具
+from langchain_core.messages import ToolMessage
+
+tool_results = []
+for tc in ai_msg.tool_calls:
+    if tc["name"] == "get_weather":
+        result = get_weather.invoke(tc["args"])  # 实际执行
+        tool_results.append(ToolMessage(content=result, tool_call_id=tc["id"]))
+
+# 3. 把工具结果+历史消息传给 LLM 继续推理
+messages = [HumanMessage("北京天气？"), ai_msg] + tool_results
+final = llm.invoke(messages)
+# final.content → "北京今天晴天，25°C，是个好天气！"
+```
+
+整个过程：**用户提问 → LLM 要工具 → 你执行工具 → LLM 看结果 → LLM 最终回答。**
+
+---
+
+## Structured Output：让 LLM 输出格式化数据
+
+很多时候你不想拿纯文本，想要结构化的 JSON/对象，方便程序处理。
+
+### 方法一：with_structured_output
+
+```python
+from pydantic import BaseModel, Field
+
+class WeatherReport(BaseModel):
+    """天气报告"""
+    city: str = Field(description="城市名")
+    temperature: float = Field(description="摄氏温度")
+    condition: str = Field(description="天气状况，如晴天/阴天/雨天")
+    advice: str = Field(description="出行建议")
+
+# 让 LLM 输出 Pydantic 对象
+structured_llm = llm.with_structured_output(WeatherReport)
+
+result = structured_llm.invoke("北京今天30度，大太阳")
+# result 是 WeatherReport 实例，不是字符串
+print(result.city)         # "北京"
+print(result.temperature)  # 30.0
+print(result.condition)    # "晴天"
+```
+
+### 方法二：TypedDict 方案
+
+```python
+from typing import TypedDict
+
+class SentimentResult(TypedDict):
+    sentiment: str    # "positive" / "negative" / "neutral"
+    score: float      # 0.0 - 1.0
+    reason: str
+
+structured_llm = llm.with_structured_output(SentimentResult)
+result = structured_llm.invoke("分析：这个产品太好用了")
+# result["sentiment"] → "positive", result["score"] → 0.9
+```
+
+> 一句话：Structured Output 让 LLM 从"写作文"变成"填表格"，方便写代码处理。
+
+---
+
+## 为什么要用 LangGraph？
+
+LangChain 擅长处理**线性的、单向的**流程（A → B → C → D）。但构建 Agent 时，流程往往是**循环的、有分支的**：
+
+- LLM 调用工具 → 看到结果 → 还想调工具 → 循环
+- 两个 Agent 互相对话 → 你来我往 → 循环
+- 出错了要重试 → 跳到错误处理节点 → 再回来
+
+用 `if/while` 手写这些逻辑能工作，但会越来越乱。LangGraph 的思路：
+
+**把你的 Agent 工作流画成一张有向图——节点是执行步骤，边是流转方向，状态在节点间自动传递和累积。LangGraph 管理状态，你只写节点的业务逻辑。**
+
+---
+
+## LangGraph 基础：有状态图
+
+### 第一步：定义状态
+
+```python
+from typing import TypedDict
+
+class MyState(TypedDict):
+    messages: list
+    user_name: str
+    task_result: str
+```
+
+`TypedDict` 定义图中流转的数据结构。每个节点读这个 dict，返回部分字段，LangGraph 自动合并。
+
+### 第二步：创建图
+
+```python
+from langgraph.graph import StateGraph, START, END
+
+workflow = StateGraph(MyState)
+```
+
+### 第三步：定义节点函数
+
+```python
+def greeter(state: MyState) -> dict:
+    """每个节点接收 state，返回要更新的字段"""
+    name = state["user_name"]
+    return {"messages": [f"你好 {name}！"]}
+
+def task_doer(state: MyState) -> dict:
+    return {"task_result": "任务完成"}
+```
+
+节点函数的签名统一是 `(state) -> dict`。返回的 dict 会**合并**到全局 state 中。
+
+### 第四步：加边，编译，运行
+
+```python
+# 添加节点
+workflow.add_node("greeter", greeter)
+workflow.add_node("task_doer", task_doer)
+
+# 定义流转
+workflow.add_edge(START, "greeter")      # 入口 → greeter
+workflow.add_edge("greeter", "task_doer") # greeter → task_doer
+workflow.add_edge("task_doer", END)      # task_doer → 出口
+
+# 编译并运行
+graph = workflow.compile()
+result = graph.invoke({"user_name": "小明"})
+# result → {"user_name": "小明", "messages": ["你好 小明！"], "task_result": "任务完成"}
+```
+
+流程图：
+
+```
+START → greeter → task_doer → END
+```
+
+`START` 和 `END` 是 LangGraph 内置的哨兵节点，代表图的起点和终点。
+
+---
+
+## MessagesState：消息累加器
+
+这是 LangGraph 最重要的内置状态类型。先看问题：
+
+```python
+class MyState(TypedDict):
+    messages: list
+
+def node_a(state):
+    return {"messages": [AIMessage("A说了一些话")]}
+
+def node_b(state):
+    return {"messages": [AIMessage("B说了一些话")]}
+
+# 问题：node_b 返回后会覆盖 node_a 的结果！
+# 最终 messages = [AIMessage("B说了一些话")]，node_a 的丢了
+```
+
+`MessagesState` 解决了这个问题——它的 `messages` 字段有一个**特殊的累加器（reducer）**：
 
 ```python
 from langgraph.graph import MessagesState
 
-class AgentState(MessagesState):
-    company_of_interest: str
-    market_report: str
-    # ... 更多字段
+class MyAgentState(MessagesState):
+    # messages 字段已内置（带累加逻辑），你只需要加额外字段
+    report: str
+    decision: str
 ```
 
-`MessagesState` 的核心是 `messages` 字段，它有一个特殊的 **reducer**：`add_messages`。
+**关键区别**：
 
-**普通字段**：返回 `{"market_report": "xxx"}` → 覆盖旧值
-**`messages` 字段**：返回 `{"messages": [new_msg]}` → **追加**到现有消息列表末尾
+| 普通字段 | `messages` 字段 |
+|---------|----------------|
+| `return {"report": "xxx"}` → 覆盖旧值 | `return {"messages": [msg]}` → **追加**到列表末尾 |
+| 新值替换旧值 | 新消息追加到已有消息后 |
 
 ```python
-# 初始状态
+# 初始
 state["messages"] = [HumanMessage("分析 AAPL")]
 
-# 节点返回
-node_return = {"messages": [AIMessage("让我查一下数据...", tool_calls=[...])]}
+# node_a 返回
+return {"messages": [AIMessage("让我查数据...")]}
+# 自动合并后 → [HumanMessage("分析 AAPL"), AIMessage("让我查数据...")]
 
-# 自动合并后
-state["messages"] = [HumanMessage("分析 AAPL"), AIMessage("让我查一下数据...", tool_calls=[...])]
+# node_b 返回
+return {"messages": [AIMessage("数据拿到了，建议买入")]}
+# 自动合并后 → [HumanMessage("分析 AAPL"), AIMessage("让我查数据..."), AIMessage("数据拿到了，建议买入")]
 ```
 
-这就是多轮 Agent 对话能持续累积上下文的原因。**没有 `MessagesState`，每次返回都会覆盖整个消息列表。**
+这就是 Agent 多轮对话能**持续累积上下文**的底层机制。没有这个累加器，每次返回都会覆盖整个对话历史。
 
-### 2.5 子状态（Nested TypedDict）
+---
 
-本项目用 `TypedDict` 定义嵌套子状态：
+## 条件边：动态路由
 
-```python
-class InvestDebateState(TypedDict):
-    history: Annotated[str, "辩论历史"]
-    current_response: Annotated[str, "当前发言方"]
-    count: Annotated[int, "辩论轮数"]
-
-class AgentState(MessagesState):
-    investment_debate_state: InvestDebateState
-```
-
-**注意**：子状态没有自定义 reducer，所以返回时会**整体替换**。节点必须返回包含所有字段的完整 dict：
+静态边是固定的 A → B。条件边是：**根据当前状态，决定下一步去哪**。
 
 ```python
-# 在 Bull Researcher 节点中
-return {
-    "investment_debate_state": {
-        "history": old_history + "\n" + new_argument,  # 追加
-        "current_response": "Bull Researcher",          # 更新
-        "count": old_count + 1,                         # 递增
+import random
+
+def random_router(state: MyState) -> str:
+    """路由函数：返回下一个节点的名字"""
+    if random.random() > 0.5:
+        return "path_a"
+    return "path_b"
+
+# 加条件边
+workflow.add_conditional_edges(
+    "source_node",   # 源节点
+    random_router,   # 路由函数（签名为 (state) -> str）
+    {
+        "path_a": "node_a",  # 返回 "path_a" → 去 node_a
+        "path_b": "node_b",  # 返回 "path_b" → 去 node_b
     }
-}
+)
 ```
 
-### 2.6 编译与运行
+**路由函数的规则**：
+- 签名为 `(state) -> str`
+- 返回值必须是 `add_conditional_edges` 的第三个参数中定义的 key
+- 逻辑可以是任意的 Python 代码：读 state 字段、调 LLM、查数据库……
+
+**实际应用**——工具循环的出口判断：
 
 ```python
-# 编译图
-graph = workflow.compile(checkpointer=saver)  # 有断点续跑
-graph = workflow.compile()                     # 无断点续跑
-
-# 两种运行方式
-# 1. stream — 逐步返回（调试用）
-for chunk in graph.stream(init_state, stream_mode="values", config=config):
-    print(chunk)
-
-# 2. invoke — 一次返回最终结果（生产用）
-final_state = graph.invoke(init_state, config=config)
+def should_call_tool(state: AgentState) -> str:
+    last_message = state["messages"][-1]
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        return "tools"       # LLM 说需要调工具 → 去执行
+    return "next_step"       # LLM 给出了最终回复 → 继续下一阶段
 ```
 
-`config` 中包含 `thread_id`（用于断点续跑）和 `recursion_limit`（防止无限循环的安全上限，本项目默认 100）。
+**多分支条件边**：
 
-### 2.7 断点续跑（Checkpoints）
+```python
+def complexity_router(state) -> str:
+    question = state["question"]
+    if len(question) < 10:
+        return "simple"
+    elif "代码" in question:
+        return "code"
+    return "complex"
 
-LangGraph 内置的状态持久化机制。本项目使用 SQLite：
+workflow.add_conditional_edges(
+    "router",
+    complexity_router,
+    {
+        "simple": "simple_handler",
+        "code": "code_handler",
+        "complex": "complex_handler",
+    }
+)
+```
+
+---
+
+## Agent 工具循环
+
+把前面的内容串起来，实现一个完整的"LLM 自主调工具"Agent：
+
+```
+Human提问 → LLM思考 → 要不要调工具？
+                        ↓ (要)        ↓ (不要)
+                    ToolNode执行     最终回答
+                        ↓
+                    回到 LLM（看结果继续思考）
+```
+
+### 代码实现
+
+```python
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.prebuilt import ToolNode
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+
+# 1. 定义工具
+@tool
+def search(query: str) -> str:
+    """搜索互联网信息"""
+    return f"关于'{query}'的搜索结果：..."
+
+@tool
+def save_to_file(content: str, filename: str) -> str:
+    """保存内容到文件"""
+    with open(filename, "w") as f:
+        f.write(content)
+    return f"已保存到 {filename}"
+
+tools = [search, save_to_file]
+
+# 2. 给 LLM 绑定工具
+llm = ChatOpenAI(model="gpt-4o")
+llm_with_tools = llm.bind_tools(tools)
+
+# 3. 核心节点：LLM 推理
+def agent(state: MessagesState) -> dict:
+    """Agent 节点：调用 LLM"""
+    response = llm_with_tools.invoke(state["messages"])
+    return {"messages": [response]}
+
+# 4. 建图
+workflow = StateGraph(MessagesState)
+
+workflow.add_node("agent", agent)
+workflow.add_node("tools", ToolNode(tools))
+
+workflow.add_edge(START, "agent")
+
+# 5. 加条件边：agent 执行完后，判断是去调工具还是结束
+def should_continue(state: MessagesState) -> str:
+    last_msg = state["messages"][-1]
+    if last_msg.tool_calls:
+        return "tools"
+    return END
+
+workflow.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
+workflow.add_edge("tools", "agent")  # 工具执行完回到 agent
+
+graph = workflow.compile()
+
+# 6. 运行
+result = graph.invoke({
+    "messages": [HumanMessage("帮我搜索 LangGraph 最新动态，然后保存到 result.txt")]
+})
+```
+
+### 运行时发生了什么
+
+```
+第1轮: agent 调 LLM → LLM 返回 tool_calls=[search("LangGraph 最新动态")]
+      → 条件边路由到 tools
+      → ToolNode 执行 search，返回 ToolMessage("关于 LangGraph...")
+      → tools → agent（进入第2轮）
+
+第2轮: agent 调 LLM（看到搜索结果）→ LLM 返回 tool_calls=[save_to_file("...", "result.txt")]
+      → 条件边路由到 tools
+      → ToolNode 执行 save_to_file，返回 ToolMessage("已保存到 result.txt")
+      → tools → agent（进入第3轮）
+
+第3轮: agent 调 LLM（看到保存成功）→ LLM 返回 "已帮你搜索并保存..."
+      → 条件边路由到 END
+```
+
+这就是 LangGraph 最核心的模式：**Agent 工具循环**。
+
+---
+
+## 多 Agent 协作
+
+工具循环是"一个 Agent + 工具"。更复杂的场景是**多个 Agent 像团队一样协作**。
+
+### 模式一：流水线（串联）
+
+每个 Agent 完成自己的任务，输出交给下一个：
+
+```python
+def researcher(state):  # 做研究
+    return {"research": "研究发现..."}
+
+def writer(state):      # 写报告
+    return {"report": f"基于研究：{state['research']}，写出报告"}
+
+def reviewer(state):    # 审核
+    return {"final_report": state["report"] + "\n[已审核]"}
+
+workflow.add_edge(START, "researcher")
+workflow.add_edge("researcher", "writer")
+workflow.add_edge("writer", "reviewer")
+workflow.add_edge("reviewer", END)
+```
+
+### 模式二：辩论（B 跳）
+
+两个 Agent 互相辩论直到达成共识或达到轮数上限：
+
+```python
+def bull(state: DebateState) -> dict:
+    """多头：提出看涨理由"""
+    response = llm.invoke(f"你是多头分析师，针对以下观点反驳并给出看涨理由：{state.get('current')}")
+    return {"history": state["history"] + f"\n多头：{response.content}", "round": state["round"] + 1}
+
+def bear(state: DebateState) -> dict:
+    """空头：提出看跌理由"""
+    response = llm.invoke(f"你是空头分析师，反驳多头的观点：{state.get('current')}")
+    return {"history": state["history"] + f"\n空头：{response.content}", "round": state["round"]}
+
+def debate_router(state: DebateState) -> str:
+    if state["round"] >= 3:   # 最多辩论 3 轮
+        return "judge"        # 去裁判
+    return "bull" if state["round"] % 2 == 0 else "bear"
+
+workflow.add_conditional_edges("bull", debate_router, {
+    "judge": "judge",
+    "bear": "bear",
+})
+workflow.add_conditional_edges("bear", debate_router, {
+    "judge": "judge",
+    "bull": "bull",
+})
+```
+
+流程图：
+
+```
+Bull → Bear → Bull → Bear → Judge → END
+  ↑______________|                (3轮后)
+```
+
+### 模式三：并行 + 汇总
+
+多个分析师同时工作，结果汇总到一个节点：
+
+```python
+# 四个分析师各自独立分析
+for name in ["market_analyst", "news_analyst", "fundamentals_analyst", "social_analyst"]:
+    workflow.add_node(name, create_analyst(llm))
+
+# 所有分析师结果汇总到 manager
+workflow.add_edge("market_analyst", "manager")
+workflow.add_edge("news_analyst", "manager")
+workflow.add_edge("fundamentals_analyst", "manager")
+workflow.add_edge("social_analyst", "manager")
+
+# START 连到所有分析师——它们并行执行
+for name in ["market_analyst", "news_analyst", "fundamentals_analyst", "social_analyst"]:
+    workflow.add_edge(START, name)
+```
+
+LangGraph 会自动并行执行从同一个源节点分叉出来的多个目标节点。汇总节点等待所有前驱完成后才执行。
+
+---
+
+## 断点续跑
+
+LangGraph 内置了 checkpoint 机制：每个节点执行完后，自动把状态保存下来。如果程序崩溃，下次用同一个 `thread_id` 运行会从断点继续，不会重跑已完成的部分。
+
+```python
+from langgraph.checkpoint.memory import MemorySaver
+
+# 编译时传入 checkpointer
+memory = MemorySaver()
+graph = workflow.compile(checkpointer=memory)
+
+# 用 thread_id 标识一次运行
+config = {"configurable": {"thread_id": "run_001"}}
+
+# 第一次运行——假设第 3 步崩溃了
+try:
+    graph.invoke(initial_state, config=config)
+except Exception:
+    pass
+
+# 第二次运行——自动从第 3 步继续，不重跑前两步
+result = graph.invoke(None, config=config)  # state 传 None 表示恢复
+```
+
+**生产环境用 SQLite**：
 
 ```python
 from langgraph.checkpoint.sqlite import SqliteSaver
 
-# 创建
-with SqliteSaver.from_conn_string("checkpoints/AAPL.db") as saver:
-    saver.setup()  # 创建 writes 和 checkpoints 表
+with SqliteSaver.from_conn_string("checkpoints.db") as saver:
+    saver.setup()
     graph = workflow.compile(checkpointer=saver)
-
-    # 运行，thread_id 决定"谁的状态"
-    graph.invoke(init_state, config={"configurable": {"thread_id": "abc123"}})
+    graph.invoke(initial_state, config={"configurable": {"thread_id": "task_001"}})
 ```
 
-**原理**：
-- 每个节点执行完后，LangGraph 自动将状态写入 SQLite
-- 如果崩溃，下次用相同 `thread_id` 运行会自动从最后完成的节点继续
-- 本项目用 `SHA256("TICKER:DATE")` 生成 thread_id，所以同一天重新跑同一个股票会自动续跑
-- 跑完后清除 checkpoint，避免下次误续
-
-### 2.8 本项目图结构总览
-
-```
-START
-  │
-  ├─ Market Analyst ←→ tools_market ──→ Msg Clear Market
-  ├─ Social Analyst ←→ tools_social ──→ Msg Clear Social      (可选)
-  ├─ News Analyst ←→ tools_news ──→ Msg Clear News            (可选)
-  ├─ Fundamentals Analyst ←→ tools_fundamentals ──→ Msg Clear (可选)
-  │
-  ├─ Bull Researcher ←→ Bear Researcher    (辩论循环, N轮)
-  │
-  ├─ Research Manager   (结构化输出: ResearchPlan)
-  ├─ Trader             (结构化输出: TraderProposal)
-  │
-  ├─ Aggressive ←→ Conservative ←→ Neutral  (风险评估循环, N轮)
-  │
-  └─ Portfolio Manager  (结构化输出: PortfolioDecision) → END
-```
+**关键点**：
+- `thread_id` 是状态的唯一标识，不同 thread 互不干扰
+- 节点执行完后自动保存，不是执行前
+- 如果你想手动设置断点，可以在 `compile()` 时传 `interrupt_before=["节点名"]`，使图在某个节点前暂停，等待人工审核
 
 ---
 
-## LangChain：LLM 调用与工具绑定
+## 完整实战：构建一个股票分析 Agent
 
-### 3.1 ChatPromptTemplate — 模板化 Prompt
+把前面所有概念串起来，实现一个简化的股票分析 Agent。
 
-```python
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+### 整体架构
 
-system_message = "你是一个市场分析师。用中文回答。"
-
-prompt = ChatPromptTemplate.from_messages([
-    ("system", system_message),
-    MessagesPlaceholder(variable_name="messages"),  # 这里插入消息历史
-])
-
-# 构造输入
-chain = prompt | llm  # LCEL (LangChain Expression Language)
-result = chain.invoke({"messages": state["messages"]})
+```
+用户提问 → 股票数据 Agent（查价格、指标）
+         → 新闻分析 Agent（搜索新闻）
+         → 综合判断 Agent（汇总 + 决策）
+         → 输出结构化结果
 ```
 
-`MessagesPlaceholder` 会在 prompt 中插入完整的消息历史（system → user → assistant → tool → ...），让 LLM 能看到完整的对话上下文。这是构建多轮对话 Agent 的关键组件。
-
-### 3.2 bind_tools — 让 LLM 调用工具
+### 完整代码
 
 ```python
+import os
+from typing import TypedDict, Annotated, Literal
+from pydantic import BaseModel, Field
+from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import MemorySaver
 
-# 1. 定义工具函数
+# ============================================================
+# 第1步：定义工具
+# ============================================================
+
 @tool
-def get_stock_data(ticker: str, start_date: str, end_date: str) -> str:
-    """获取股票历史价格数据。"""
-    ...
+def get_stock_price(ticker: str) -> str:
+    """获取股票最新价格。ticker 如 AAPL, GOOGL"""
+    # 模拟数据（实际项目中调用 yfinance 或 API）
+    prices = {"AAPL": "188.50", "GOOGL": "142.30", "TSLA": "245.10", "MSFT": "378.20"}
+    return f"{ticker} 当前价格：${prices.get(ticker, '未知')}"
 
-# 2. 绑定到 LLM
-tools = [get_stock_data, get_indicators]
+@tool
+def get_financial_indicators(ticker: str) -> str:
+    """获取股票财务指标，包括 PE、PB、ROE 等"""
+    # 模拟数据
+    indicators = {
+        "AAPL": "PE: 28.5, ROE: 45%, PB: 12.3, 营收增速: 15%",
+        "GOOGL": "PE: 24.3, ROE: 23%, PB: 6.8, 营收增速: 12%",
+    }
+    return f"{ticker} 指标：{indicators.get(ticker, 'PE: 20, ROE: 15%, PB: 5.0, 营收增速: 10%')}"
+
+@tool
+def search_news(query: str) -> str:
+    """搜索股票相关新闻。query 为搜索关键词"""
+    news = {
+        "AAPL": "1. iPhone 17 销量超预期 2. 苹果发布新 AI 战略 3. 伯克希尔增持苹果",
+    }
+    return f"关于 {query} 的新闻：{news.get(query, f'{query}相关新闻：无重大消息')}"
+
+tools = [get_stock_price, get_financial_indicators, search_news]
+
+# ============================================================
+# 第2步：定义状态
+# ============================================================
+
+class StockAnalysisState(MessagesState):
+    """股票分析状态 —— 继承 MessagesState 获得消息累加能力"""
+    report: str       # 分析师报告
+    decision: str     # 最终决策
+
+# ============================================================
+# 第3步：定义节点
+# ============================================================
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
 llm_with_tools = llm.bind_tools(tools)
 
-# 3. LLM 的响应会包含 tool_calls
-result = llm_with_tools.invoke(prompt)
-# result.tool_calls → [{"name": "get_stock_data", "args": {"ticker": "AAPL", ...}, "id": "..."}]
-# 或者 result.content → "根据数据分析，建议买入..."（不需要工具时）
+def stock_analyst(state: StockAnalysisState) -> dict:
+    """股票分析 Agent：调用工具获取数据并分析"""
+    system_prompt = """你是一位专业的股票分析师。请根据用户的问题，使用可用工具获取数据并分析。
+    如果需要多个工具，可以一次只调用一个，工具结果返回后继续分析。
+    最终请用中文给出简洁的分析报告。"""
+
+    messages = [SystemMessage(content=system_prompt)] + state["messages"]
+    response = llm_with_tools.invoke(messages)
+    # 如果这次回复有文字内容（不是纯工具调用），保存为报告
+    report = response.content if response.content and not response.tool_calls else ""
+    return {"messages": [response], "report": state.get("report", "") + report}
+
+def router(state: StockAnalysisState) -> str:
+    """判断是否需要继续调工具"""
+    last_msg = state["messages"][-1]
+    if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+        return "tools"
+    return "done"
+
+# ============================================================
+# 第4步：建图
+# ============================================================
+
+workflow = StateGraph(StockAnalysisState)
+
+workflow.add_node("analyst", stock_analyst)
+workflow.add_node("tools", ToolNode(tools))
+
+workflow.add_edge(START, "analyst")
+workflow.add_conditional_edges("analyst", router, {
+    "tools": "tools",
+    "done": END,
+})
+workflow.add_edge("tools", "analyst")  # 工具执行完回到 analyst
+
+graph = workflow.compile(checkpointer=MemorySaver())
+
+# ============================================================
+# 第5步：运行
+# ============================================================
+
+config = {"configurable": {"thread_id": "apple_analysis"}}
+
+result = graph.invoke(
+    {"messages": [HumanMessage("分析 AAPL 股票，查价格、指标和新闻，给我一个综合判断")]},
+    config=config,
+)
+
+# 输出结果
+print("=" * 50)
+print("分析报告：")
+print(result.get("report", "无"))
 ```
 
-配合 LangGraph 的 `ToolNode`：
+### 运行日志（模拟）
 
-```python
-from langgraph.prebuilt import ToolNode
-
-tool_node = ToolNode(tools)  # 自动解析 tool_calls 并执行对应函数
 ```
-
-**工具调用循环的完整流程**：
-1. 分析师节点调用 LLM → 返回 `tool_calls`
-2. 条件边判断 `tool_calls` 存在 → 路由到 `ToolNode`
-3. `ToolNode` 执行工具，返回 `ToolMessage`
-4. 静态边回到分析师节点 → LLM 看到工具结果，继续推理
-5. 循环直到 LLM 返回纯文本（没有 `tool_calls`）
-
-### 3.3 with_structured_output — 结构化输出
-
-让 LLM 返回 Pydantic 对象而非纯文本：
-
-```python
-from pydantic import BaseModel
-
-class ResearchPlan(BaseModel):
-    """研究计划"""
-    recommendation: str   # Buy / Overweight / Hold / Underweight / Sell
-    rationale: str        # 理由
-    strategic_actions: str # 建议行动
-
-structured_llm = llm.with_structured_output(ResearchPlan)
-result = structured_llm.invoke(prompt)
-# result 是 ResearchPlan 实例，不是字符串
-# result.recommendation → "Buy"
+[analyst] LLM 收到问题 → 决定调 get_stock_price("AAPL")
+[router]  检测到 tool_calls → 路由到 tools
+[tools]   执行 get_stock_price → "AAPL 当前价格：$188.50"
+[analyst] LLM 看到价格 → 决定调 get_financial_indicators("AAPL")
+[router]  检测到 tool_calls → 路由到 tools
+[tools]   执行 get_financial_indicators → "AAPL 指标：PE: 28.5..."
+[analyst] LLM 看到指标 → 决定调 search_news("AAPL")
+[router]  检测到 tool_calls → 路由到 tools
+[tools]   执行 search_news → "关于 AAPL 的新闻：iPhone 17..."
+[analyst] LLM 看到所有数据 → 生成分析报告
+[router]  没有 tool_calls → 路由到 END
 ```
-
-**本项目的最佳实践**：结构化输出 + 回退到自由文本
-
-```python
-# tradingagents/agents/utils/structured.py
-def bind_structured(llm, Schema, agent_name):
-    try:
-        return llm.with_structured_output(Schema)
-    except (NotImplementedError, AttributeError):
-        return None  # 某些模型（如 deepseek-reasoner）不支持，静默回退
-
-def invoke_structured_or_freetext(structured_llm, plain_llm, prompt, render_fn):
-    if structured_llm:
-        try:
-            result = structured_llm.invoke(prompt)
-            return render_fn(result)  # 转为 markdown 供下游使用
-        except Exception:
-            pass  # 结构化调用失败，回退到自由文本
-    return plain_llm.invoke(prompt).content
-```
-
-**为什么要渲染回 markdown？** 因为下游节点（辩论、日志、报告）都消费 markdown 字符串。结构化输出保证格式一致（标题、分段），但最终以 markdown 形式流通。
-
-### 3.4 @tool 装饰器
-
-```python
-from langchain_core.tools import tool
-
-@tool
-def get_news(ticker: str, date: str) -> str:
-    """获取指定股票在指定日期的新闻。
-
-    Args:
-        ticker: 股票代码，如 AAPL
-        date: 日期，格式 YYYY-MM-DD
-    """
-    # 实际数据获取逻辑
-    return news_text
-```
-
-`@tool` 装饰器自动从函数签名和 docstring 提取：
-- **工具名**：函数名 (`get_news`)
-- **工具描述**：docstring 第一行
-- **参数 schema**：从类型注解和 `Args` 文档生成
-
-这些信息会被 `bind_tools` 转成 LLM 能理解的 function calling schema。
 
 ---
 
-## 本项目实战模式
+## 核心要点总结
 
-### 模式一：Agent 工具循环（分析师）
-
-```
-Analyst Node ──(有 tool_calls?)──→ ToolNode ──→ Analyst Node
-       │                                    (循环)
-       │ (无 tool_calls: 分析完成)
-       ▼
-   Msg Clear ──→ 下一个分析师
-```
-
-关键代码结构：
-
-```python
-def create_analyst(llm):
-    tools = [tool1, tool2]
-    llm_with_tools = llm.bind_tools(tools)
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
-        MessagesPlaceholder("messages"),
-    ])
-
-    def node(state):
-        result = prompt | llm_with_tools).invoke({"messages": state["messages"]})
-        report = result.content if not result.tool_calls else ""
-        return {"messages": [result], "report_field": report}
-
-    return node
-```
-
-### 模式二：辩论循环（Bull/Bear Researcher）
-
-```
-Bull Researcher ──→ Bear Researcher ──→ Bull Researcher ──→ ...
-                                            │ (达到最大轮数)
-                                            ▼
-                                       Research Manager
-```
-
-关键：子状态手动管理，每次返回完整 dict。
-
-### 模式三：结构化输出（Manager/Trader）
-
-```
-Report → LLM.with_structured_output(Schema) → Pydantic 对象 → render() → markdown
-                                                      │ (失败)
-                                                      ▼
-                                              LLM.invoke() → 自由文本
-```
-
-### 模式四：多 LLM 分层
-
-本项目使用**两个 LLM 实例**：
-
-| LLM 类型 | 用途 | 配置 |
-|----------|------|------|
-| `quick_thinking_llm` | 分析师、辩论者、交易员 | 快/便宜的模型 |
-| `deep_thinking_llm` | Research Manager、Portfolio Manager | 强/贵的模型 |
-
-这是成本与质量的平衡：大量中间步骤用便宜模型，最终决策用强模型。
+| 概念 | 一句话解释 |
+|------|----------|
+| **LangChain** | LLM 开发的"标准库"，统一调用接口、工具绑定、结构化输出 |
+| **LCEL** | `\|` 管道符，把 prompt / LLM / parser 串成流水线 |
+| **@tool** | 装饰器，把普通函数变成 LLM 可调用的工具 |
+| **with_structured_output** | 让 LLM 输出 Pydantic 对象，不是纯文本 |
+| **LangGraph** | 用"有向图"建模 Agent 工作流，自动管理状态 |
+| **StateGraph** | 图 → 节点是步骤，边是流转方向 |
+| **MessagesState** | 带消息累加器的状态基类，多轮对话自动追加 |
+| **条件边** | 路由函数 `(state) -> str` 决定下一步去哪 |
+| **ToolNode** | 自动解析 LLM 的 tool_calls 并执行对应的 `@tool` 函数 |
+| **工具循环** | Agent ↔ ToolNode 循环，直到 LLM 不再要工具 |
+| **Checkpoint** | 自动保存状态，崩溃后从断点继续 |
 
 ---
 
-## 关键文件索引
+## 学习建议
 
-| 文件 | 学习要点 |
-|------|---------|
-| `tradingagents/graph/setup.py` | StateGraph 构建、条件边、工具循环 |
-| `tradingagents/graph/trading_graph.py` | 图编译、运行、checkpoint 管理 |
-| `tradingagents/graph/conditional_logic.py` | 条件路由函数（工具循环出口、辩论出口） |
-| `tradingagents/agents/utils/agent_states.py` | MessagesState、子状态 TypedDict |
-| `tradingagents/agents/utils/structured.py` | with_structured_output + 回退模式 |
-| `tradingagents/agents/analysts/market_analyst.py` | 工具绑定 Agent 节点示例 |
-| `tradingagents/agents/managers/portfolio_manager.py` | 结构化输出 + Memory 注入 |
-| `tradingagents/agents/researchers/bull_researcher.py` | 纯文本辩论节点示例 |
-| `tradingagents/llm_clients/` | 多 provider LLM 工厂模式 |
-| `tradingagents/graph/checkpointer.py` | SqliteSaver 断点续跑 |
-| `tradingagents/dataflows/core_stock_tools.py` | @tool 装饰器定义工具 |
+1. **先跑起来**：复制上面的完整实战代码，换自己的 API Key 跑一遍，感受 Agent 工具循环
+2. **改工具**：把 mock 工具换成真实 API，感受 LLM 如何自适应不同的工具
+3. **加 Agent**：在图上多加一个节点（比如风险评估），感受多 Agent 协作
+4. **加辩论**：实现 Bull/Bear 辩论循环，感受条件边的灵活性
+5. **看源码**：LangGraph 源码很精简（核心不到 2000 行），值得一读
 
----
-
-## 推荐学习路径
-
-1. **先看** `agent_states.py` — 理解状态结构（5 分钟）
-2. **再看** `market_analyst.py` — 理解一个 Agent 节点怎么写（10 分钟）
-3. **然后看** `conditional_logic.py` — 理解条件路由怎么工作（10 分钟）
-4. **最后看** `setup.py` — 理解整张图怎么串起来（20 分钟）
-
-阅读时重点关注：状态怎么更新、消息怎么流转、LLM 怎么调用、条件路由怎么判断。其余是业务逻辑，可以后续再看。
+下一步可以阅读 [LangGraph 官方文档](https://langchain-ai.github.io/langgraph/) 的 Tutorials 部分。
