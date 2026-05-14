@@ -1,1750 +1,1464 @@
-# TradingAgents Rust 实现设计文档
+# TradingAgents 重构需求分析文档
 
-本文档设计如何用 Rust 重新实现 TradingAgents，保持与 Python 版本完全一致的业务流程，但对 LangChain/LangGraph 这类 Python 生态独有的通用框架做**最小化硬编码替代**——流程写死，必要的抽象保留。
+> **文档类型**: 需求分析（Requirements Analysis）
+> **源项目**: TradingAgents v0.2.4
+> **源语言**: Python (LangChain + LangGraph)
+> **目标**: 重构到其他语言（如 Rust/Go/TypeScript 等）
+> **日期**: 2026-05-14
 
 ---
 
 ## 目录
 
-1. [架构总览](#架构总览)
-2. [核心抽象：Rust 里的 "LCEL"](#核心抽象rust-里的-lcel)
-3. [LLM 客户端抽象](#llm-客户端抽象)
-4. [Tool Calling：Rust 里的工具系统](#tool-callingrust-里的工具系统)
-5. [Structured Output：Typed 输出](#structured-outputtyped-输出)
-6. [图执行引擎：硬编码的 StateGraph](#图执行引擎硬编码的-stategraph)
-7. [Agent 状态定义](#agent-状态定义)
-8. [Analyst 节点 + 工具循环](#analyst-节点--工具循环)
-9. [辩论循环：Bull vs Bear](#辩论循环bull-vs-bear)
-10. [风险管理辩论 + 最终决策](#风险管理辩论--最终决策)
-11. [Checkpoint / 断点续跑](#checkpoint-断点续跑)
-12. [Memory / 反思系统](#memory-反思系统)
-13. [数据供应商抽象](#数据供应商抽象)
-14. [配置系统](#配置系统)
-15. [完整代码骨架](#完整代码骨架)
-16. [Python vs Rust 对照表](#python-vs-rust-对照表)
+1. [系统概述](#1-系统概述)
+2. [业务流程](#2-业务流程)
+3. [功能需求](#3-功能需求)
+   - [3.1 图编排引擎](#31-图编排引擎)
+   - [3.2 LLM 客户端层](#32-llm-客户端层)
+   - [3.3 智能体系统](#33-智能体系统)
+   - [3.4 工具与数据源](#34-工具与数据源)
+   - [3.5 结构化输出](#35-结构化输出)
+   - [3.6 决策记忆日志](#36-决策记忆日志)
+   - [3.7 事后反思](#37-事后反思)
+   - [3.8 断点续跑](#38-断点续跑)
+   - [3.9 CLI 交互界面](#39-cli-交互界面)
+   - [3.10 报告生成](#310-报告生成)
+   - [3.11 配置系统](#311-配置系统)
+4. [数据模型](#4-数据模型)
+5. [接口契约](#5-接口契约)
+6. [非功能性需求](#6-非功能性需求)
+7. [安全需求](#7-安全需求)
+8. [测试需求](#8-测试需求)
+9. [迁移约束](#9-迁移约束)
+10. [附录](#10-附录)
 
 ---
 
-## 架构总览
+## 1. 系统概述
 
-Python 版依赖 LangGraph 做图调度、LangChain 做 LLM 抽象。Rust 生态没有等价物，但我们也不需要一个通用的图执行引擎——TradingAgents 的流程是**固定的**：
+### 1.1 项目定义
 
-```
-START
-  → MarketAnalyst (↻ 工具循环)
-  → SocialAnalyst  (↻ 工具循环)
-  → NewsAnalyst    (↻ 工具循环)
-  → FundamentalsAnalyst (↻ 工具循环)
-  → BullResearcher ↔ BearResearcher (↻ 辩论, max N 轮)
-  → ResearchManager
-  → Trader
-  → AggressiveRisk ↔ ConservativeRisk ↔ NeutralRisk (↻ 辩论, max N 轮)
-  → PortfolioManager
-  → END
-```
+TradingAgents 是一个**多智能体 LLM 金融交易分析框架**。系统通过编排 12 个专业 AI 智能体协作，对给定股票在指定日期进行综合交易分析，最终输出结构化投资决策（Buy/Overweight/Hold/Underweight/Sell）。
 
-**核心设计决策：**
+### 1.2 核心价值
 
-| 问题 | 决策 |
+| 维度 | 描述 |
 |------|------|
-| 图执行引擎 | **硬编码**。一个 `run_pipeline()` 函数包含完整的顺序逻辑 + 循环。不用 DAG 调度器。 |
-| LLM 抽象 | **trait + enum 分发**。`trait LlmClient`，`enum Provider { OpenAI, Anthropic, Google, ... }` |
-| 状态管理 | **一个巨大的 `AgentState` struct**，节点函数签名 `(state: &mut AgentState) -> Result<()>` |
-| 工具系统 | **`#[async_trait]` + serde_json**。手动解析 `tool_calls`、执行、拼回 messages。 |
-| 断点续跑 | **SQLite + serde_json**。每个节点执行完 `save_checkpoint()`，崩溃后 `load_checkpoint()` 从断点继续。 |
+| **多智能体协作** | 12 个角色各司其职，模拟真实投资团队工作流 |
+| **多源数据融合** | 技术面、基本面、新闻舆情、社交媒体情绪、内部交易数据 |
+| **辩论机制** | 牛熊辩论 + 风险三方辩论，多视角碰撞 |
+| **持续学习** | 事后反思机制，历史经验注入未来决策 |
+| **多 LLM 支持** | 10+ 提供商，双模型架构（快思考+慢思考） |
 
-> Python 的 LangGraph 是"通用图引擎 + 业务节点"，Rust 版是"硬编码的业务流程 + 抽象 trait"。
+### 1.3 重构目标
 
----
-
-## 核心抽象：Rust 里的 "LCEL"
-
-LangChain 的 LCEL 本质上就是：`PromptTemplate → LLM → OutputParser`。在 Rust 中我们用 trait 表达。
-
-### 消息类型
-
-```rust
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "role")]
-pub enum Message {
-    #[serde(rename = "system")]
-    System {
-        content: String,
-    },
-    #[serde(rename = "user")]
-    Human {
-        content: String,
-    },
-    #[serde(rename = "assistant")]
-    AI {
-        content: Option<String>,
-        tool_calls: Option<Vec<ToolCall>>,
-    },
-    #[serde(rename = "tool")]
-    Tool {
-        content: String,
-        tool_call_id: String,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCall {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub call_type: String, // "function"
-    pub function: FunctionCall,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FunctionCall {
-    pub name: String,
-    pub arguments: String, // JSON string
-}
-```
-
-`Message` enum 对应 LangChain 的 `SystemMessage / HumanMessage / AIMessage / ToolMessage`。用 `serde` 序列化，与 OpenAI API 的 messages 格式完全对齐。这是 Rust 版整个系统的"通用货币"——所有 LLM provider 都读写这个格式。
-
-### Prompt 模板
-
-不需要完整的 Jinja2 引擎。用简单的 `str::replace` 即可：
-
-```rust
-pub struct PromptTemplate {
-    template: String,
-}
-
-impl PromptTemplate {
-    pub fn new(template: impl Into<String>) -> Self {
-        Self { template: template.into() }
-    }
-
-    /// 替换 {var_name} 占位符
-    pub fn format(&self, vars: &[(&str, &str)]) -> String {
-        let mut result = self.template.clone();
-        for (key, value) in vars {
-            result = result.replace(&format!("{{{}}}", key), value);
-        }
-        result
-    }
-}
-```
-
-真正的 TradingAgents 的 prompt 都非常长（几十到几百行），存储在 `prompts/` 目录下作为 `.md` 文件，运行时 `include_str!` 加载。占位符只有少数几个：`{ticker}`, `{date}`, `{reports}`, `{history}`, `{current_response}` 等。
-
-### Pipeline trait
-
-对应 LCEL 的 `|` 管道：
-
-```rust
-#[async_trait]
-pub trait Pipeline {
-    type Input;
-    type Output;
-
-    async fn invoke(&self, input: Self::Input) -> Result<Self::Output>;
-}
-
-// Prompt → LLM → String
-pub struct PromptChain {
-    template: PromptTemplate,
-    llm: Box<dyn LlmClient>,
-}
-
-#[async_trait]
-impl Pipeline for PromptChain {
-    type Input = Vec<(&'static str, String)>;
-    type Output = String;
-
-    async fn invoke(&self, vars: Self::Input) -> Result<String> {
-        let prompt = self.template.format(&vars.iter().map(|(k,v)| (*k, v.as_str())).collect::<Vec<_>>());
-        let messages = vec![Message::Human { content: prompt }];
-        let response = self.llm.chat(&messages).await?;
-        Ok(response.content)
-    }
-}
-```
-
-实际代码中，大部分节点都用 `llm.chat(messages)` 直接调用，不需要这个 pipeline trait。只有需要"模板 + LLM + 结构化输出"三件套的节点（Research Manager, Trader, Portfolio Manager）才用到组合。
+- **功能等价**: 所有现有功能必须在新实现中完整保留
+- **性能提升**: 降低启动延迟和内存占用
+- **部署简化**: 单二进制分发，消除 Python 环境依赖
+- **类型安全**: 编译期类型检查，减少运行时错误
+- **并发能力**: 支持多个 ticker 并行分析
 
 ---
 
-## LLM 客户端抽象
+## 2. 业务流程
 
-### trait 定义
+### 2.1 完整执行生命周期
 
-```rust
-use async_trait::async_trait;
-
-#[async_trait]
-pub trait LlmClient: Send + Sync {
-    /// 发送消息列表，返回 AI 消息
-    async fn chat(&self, messages: &[Message]) -> Result<Message>;
-
-    /// 发送消息列表 + 工具定义，返回 AI 消息（可能包含 tool_calls）
-    async fn chat_with_tools(
-        &self,
-        messages: &[Message],
-        tools: &[ToolDef],
-    ) -> Result<Message>;
-
-    /// 结构化输出（JSON mode / tool_choice）
-    async fn chat_structured<T: DeserializeOwned + Send>(
-        &self,
-        messages: &[Message],
-        schema: serde_json::Value,
-    ) -> Result<T>;
-
-    /// 检查模型名是否有效
-    fn validate_model(&self) -> bool;
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ToolDef {
-    pub name: String,
-    pub description: String,
-    pub parameters: serde_json::Value, // JSON Schema
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      1. 初始化阶段                               │
+├─────────────────────────────────────────────────────────────────┤
+│  加载配置 → 创建 LLM 客户端(快+慢) → 初始化数据源 → 构建图       │
+│  → 读取记忆日志 → 解析 pending 条目 → 获取收益 → 反思 → 注入上下文│
+└─────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      2. 分析执行阶段                              │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────┐       │
+│  │  I. 分析师团队 (顺序执行)                              │       │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐│       │
+│  │  │ Market   │→│ Social   │→│ News     │→│Fundament││       │
+│  │  │ Analyst  │  │ Analyst  │  │ Analyst  │  │Analyst  ││       │
+│  │  │          │  │          │  │          │  │         ││       │
+│  │  │ tools:   │  │ tools:   │  │ tools:   │  │ tools:  ││       │
+│  │  │ stock    │  │ news     │  │ news     │  │fundament││       │
+│  │  │indicators│  │          │  │global_news│ │balance  ││       │
+│  │  │          │  │          │  │insider   │  │cashflow ││       │
+│  │  └──────────┘  └──────────┘  └──────────┘  │income   ││       │
+│  │                                              └────────┘│       │
+│  └──────────────────────────────────────────────────────┘       │
+│                          │                                       │
+│                          ▼                                       │
+│  ┌──────────────────────────────────────────────────────┐       │
+│  │  II. 研究辩论 (多轮循环)                                │       │
+│  │  ┌──────────────┐        ┌──────────────┐             │       │
+│  │  │ Bull         │ ←───→  │ Bear         │             │       │
+│  │  │ Researcher   │ 辩论N轮 │ Researcher   │             │       │
+│  │  └──────────────┘        └──────────────┘             │       │
+│  │              │                  │                      │       │
+│  │              └────────┬─────────┘                      │       │
+│  │                       ▼                                │       │
+│  │              ┌────────────────┐                        │       │
+│  │              │Research Manager│ → ResearchPlan         │       │
+│  │              └────────────────┘                        │       │
+│  └──────────────────────────────────────────────────────┘       │
+│                          │                                       │
+│                          ▼                                       │
+│  ┌──────────────────────────────────────────────────────┐       │
+│  │  III. 交易决策                                         │       │
+│  │  ┌────────────────┐                                   │       │
+│  │  │    Trader      │ → TraderProposal                  │       │
+│  │  └────────────────┘                                   │       │
+│  └──────────────────────────────────────────────────────┘       │
+│                          │                                       │
+│                          ▼                                       │
+│  ┌──────────────────────────────────────────────────────┐       │
+│  │  IV. 风险辩论 (三角多轮循环)                            │       │
+│  │  ┌──────────────┐                                      │       │
+│  │  │  Aggressive  │←──────→┌──────────────────┐         │       │
+│  │  │   Analyst    │         │  Conservative    │         │       │
+│  │  └──────────────┘         │    Analyst       │         │       │
+│  │       ↑    │              └──────────────────┘         │       │
+│  │       │    └────────────→ ┌──────────────────┐         │       │
+│  │       └───────────────────│    Neutral       │         │       │
+│  │              N轮循环       │    Analyst       │         │       │
+│  │                           └──────────────────┘         │       │
+│  │              │                  │                       │       │
+│  │              └────────┬─────────┘                       │       │
+│  │                       ▼                                 │       │
+│  │              ┌────────────────────┐                     │       │
+│  │              │ Portfolio Manager  │ → PortfolioDecision │       │
+│  │              └────────────────────┘                     │       │
+│  └──────────────────────────────────────────────────────┘       │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      3. 后处理阶段                               │
+├─────────────────────────────────────────────────────────────────┤
+│  信号提取 → 状态持久化(JSON) → 追加 pending 决策到记忆日志       │
+│  → 清除 checkpoint → 展示/导出报告                               │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Provider 实现
+### 2.2 关键时序约束
 
-```rust
-pub enum Provider {
-    OpenAI,
-    Anthropic,
-    Google,
-    DeepSeek,
-    Xai,
-    Qwen,
-    Glm,
-    OpenRouter,
-    Ollama,
-}
+| 约束 | 说明 |
+|------|------|
+| **分析师顺序** | 默认按 market → social → news → fundamentals 顺序执行（每个分析师产生完整报告后，下一个才开始）。架构上可以改为并行 |
+| **分析师工具循环** | 每个分析师内部 LLM 与工具之间循环调用，直到 LLM 不再要求工具调用 |
+| **分析师间消息清理** | 每个分析师完成后，messages 清空并置入 "Continue" 占位消息（Anthropic 兼容性要求） |
+| **辩论轮次** | Bull↔Bear 最多 `max_debate_rounds * 2` 回合（默认 2 回合即 1 轮）；Risk 三角最多 `max_risk_discuss_rounds * 3` 回合（默认 3 回合） |
+| **结构化输出串行** | Research Manager → Trader → Portfolio Manager 严格顺序，下游依赖上游输出 |
+| **反思延迟** | 反思在下一次同 ticker 运行时执行（Phase B），因为需要实际市场结果数据（需等待交易日过后） |
+| **checkpoint 生命周期** | 节点成功后立即保存 checkpoint；整个 pipeline 成功后清除 |
 
-impl Provider {
-    pub fn default_base_url(&self) -> &str {
-        match self {
-            Self::OpenAI => "https://api.openai.com/v1",
-            Self::Anthropic => "https://api.anthropic.com",
-            Self::DeepSeek => "https://api.deepseek.com/v1",
-            // ...
-        }
-    }
+### 2.3 快速/深度模型分工
 
-    pub fn api_key_env(&self) -> &str {
-        match self {
-            Self::OpenAI => "OPENAI_API_KEY",
-            Self::Anthropic => "ANTHROPIC_API_KEY",
-            Self::DeepSeek => "DEEPSEEK_API_KEY",
-            // ...
-        }
-    }
-}
 ```
+quick_thinking_llm (快速模型, e.g. GPT-5.4-mini):
+  ├── Market Analyst
+  ├── Social Media Analyst
+  ├── News Analyst
+  ├── Fundamentals Analyst
+  ├── Bull Researcher
+  ├── Bear Researcher
+  ├── Trader
+  ├── Aggressive Risk Analyst
+  ├── Conservative Risk Analyst
+  ├── Neutral Risk Analyst
+  └── Reflector (事后反思)
 
-### OpenAI-compatible 客户端（最通用的实现）
-
-```rust
-use reqwest::Client;
-use serde_json::Value;
-
-pub struct OpenAiCompatClient {
-    provider: Provider,
-    model: String,
-    base_url: String,
-    api_key: String,
-    http: Client,
-    extra_params: HashMap<String, Value>,
-}
-
-#[async_trait]
-impl LlmClient for OpenAiCompatClient {
-    async fn chat(&self, messages: &[Message]) -> Result<Message> {
-        let body = serde_json::json!({
-            "model": self.model,
-            "messages": messages,
-        });
-        let resp = self.http
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await?;
-        let json: Value = resp.json().await?;
-        let choice = &json["choices"][0]["message"];
-        Ok(Message::AI {
-            content: choice["content"].as_str().map(String::from),
-            tool_calls: parse_tool_calls(choice),
-        })
-    }
-
-    async fn chat_with_tools(&self, messages: &[Message], tools: &[ToolDef]) -> Result<Message> {
-        let body = serde_json::json!({
-            "model": self.model,
-            "messages": messages,
-            "tools": tools.iter().map(|t| serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.parameters,
-                }
-            })).collect::<Vec<_>>(),
-        });
-        // ... 同上
-    }
-
-    async fn chat_structured<T: DeserializeOwned + Send>(
-        &self,
-        messages: &[Message],
-        schema: serde_json::Value,
-    ) -> Result<T> {
-        let body = serde_json::json!({
-            "model": self.model,
-            "messages": messages,
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "response",
-                    "schema": schema,
-                }
-            },
-        });
-        let resp = self.http.post(...).json(&body).send().await?;
-        let text = resp["choices"][0]["message"]["content"].as_str().unwrap();
-        Ok(serde_json::from_str(text)?)
-    }
-
-    fn validate_model(&self) -> bool {
-        // 检查 model 是否在已知列表中
-        true // Ollama/OpenRouter 跳过校验
-    }
-}
-```
-
-**Anthropic 客户端**需要适配 Anthropic 的 Messages API（header `x-api-key` 而非 `Authorization: Bearer`，content 是 `[{"type": "text", "text": "..."}]` 数组而非纯字符串），以及对 `tool_use` 格式的 tool_calls 做归一化。
-
-**DeepSeek 客户端**需要处理 `reasoning_content` 字段的回显（think mode），这与 OpenAI-compatible 的 base class 共享大部分逻辑，只在 `parse_response()` 时多做一步保存 reasoning_content。
-
-### 工厂函数
-
-```rust
-pub fn create_llm_client(provider: Provider, model: &str, base_url: Option<&str>) -> Box<dyn LlmClient> {
-    let base_url = base_url.unwrap_or_else(|| provider.default_base_url()).to_string();
-    let api_key = std::env::var(provider.api_key_env()).unwrap_or_default();
-
-    match provider {
-        Provider::Anthropic => Box::new(AnthropicClient::new(model, &base_url, &api_key)),
-        // OpenAI-compatible 的 8 个 provider 全部走同一个 struct
-        _ => Box::new(OpenAiCompatClient::new(provider, model, &base_url, &api_key)),
-    }
-}
-```
-
-### 双 LLM 架构
-
-```rust
-pub struct LlmPair {
-    pub quick: Box<dyn LlmClient>,  // 分析师、研究员、交易员
-    pub deep: Box<dyn LlmClient>,   // 研究经理、投资组合经理
-}
-
-impl LlmPair {
-    pub fn from_config(config: &Config) -> Self {
-        let provider = config.llm_provider.clone();
-        Self {
-            quick: create_llm_client(provider, &config.quick_think_model, None),
-            deep: create_llm_client(provider, &config.deep_think_model, None),
-        }
-    }
-}
+deep_thinking_llm (深度模型, e.g. GPT-5.4):
+  ├── Research Manager
+  └── Portfolio Manager
 ```
 
 ---
 
-## Tool Calling：Rust 里的工具系统
+## 3. 功能需求
 
-LangChain 用 `@tool` 装饰器 + 函数签名自动推断 schema。Rust 用 **proc macro** 做不到同样丝滑（无法在编译期读函数的 docstring 作为运行时描述），所以我们用 **声明式注册**：
+### 3.1 图编排引擎
 
-### 工具定义与注册
+#### FR-1.1 节点管理
 
-```rust
-use std::collections::HashMap;
-use serde_json::Value;
+- **FR-1.1.1**: 系统必须支持注册不同类型执行节点（智能体节点、工具调用节点、消息清理节点）
+- **FR-1.1.2**: 每个节点必须具有唯一标识（名称或 ID）
+- **FR-1.1.3**: 节点必须支持异步执行
+- **FR-1.1.4**: 节点执行失败时必须有明确的错误传播机制
 
-pub type ToolFn = Arc<dyn Fn(Value) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> + Send + Sync>;
+#### FR-1.2 边与路由
 
-pub struct Tool {
-    pub def: ToolDef,
-    pub handler: ToolFn,
-}
+- **FR-1.2.1**: 系统必须支持**固定边**：节点 A 执行后无条件转移到节点 B
+- **FR-1.2.2**: 系统必须支持**条件边**：节点 A 执行后根据状态决定下一节点
+- **FR-1.2.3**: 条件路由函数必须是**纯函数**：接收状态引用，返回下一节点标识
 
-pub struct ToolRegistry {
-    tools: HashMap<String, Tool>,
-}
+#### FR-1.3 条件路由逻辑
 
-impl ToolRegistry {
-    pub fn new() -> Self {
-        Self { tools: HashMap::new() }
-    }
+必须实现以下三种条件路由模式：
 
-    pub fn register(
-        &mut self,
-        name: impl Into<String>,
-        description: impl Into<String>,
-        parameters: serde_json::Value,
-        handler: impl Fn(Value) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> + Send + Sync + 'static,
-    ) {
-        let name = name.into();
-        self.tools.insert(name.clone(), Tool {
-            def: ToolDef {
-                name,
-                description: description.into(),
-                parameters,
-            },
-            handler: Arc::new(handler),
-        });
-    }
-
-    pub fn get_defs(&self) -> Vec<ToolDef> {
-        self.tools.values().map(|t| t.def.clone()).collect()
-    }
-
-    pub async fn execute(&self, name: &str, args: Value) -> Result<String> {
-        let tool = self.tools.get(name)
-            .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", name))?;
-        (tool.handler)(args).await
-    }
-
-    pub fn filter(&self, names: &[&str]) -> Self {
-        // 返回只包含指定名称的子 ToolRegistry
-        // ...
-    }
-}
+**模式 1 — 分析师工具循环：**
+```
+输入: AgentState
+判断: last_message 是否包含 tool_calls
+  是 → 路由到工具执行节点 (tools_{analyst_type})
+  否 → 路由到消息清理节点 (Msg Clear {analyst_type})
 ```
 
-### 工具注册示例
-
-```rust
-fn register_market_tools(registry: &mut ToolRegistry) {
-    registry.register(
-        "get_stock_data",
-        "获取股票历史 OHLCV 数据",
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "ticker": {"type": "string", "description": "股票代码，如 AAPL"},
-                "start_date": {"type": "string", "description": "开始日期 YYYY-MM-DD"},
-                "end_date": {"type": "string", "description": "结束日期 YYYY-MM-DD"},
-            },
-            "required": ["ticker", "start_date", "end_date"],
-        }),
-        |args| {
-            Box::pin(async move {
-                let ticker = args["ticker"].as_str().unwrap();
-                let start = args["start_date"].as_str().unwrap();
-                let end = args["end_date"].as_str().unwrap();
-                get_stock_data(ticker, start, end).await
-            })
-        },
-    );
-
-    registry.register(
-        "get_indicators",
-        "获取技术指标，包括 RSI, MACD, SMA, Bollinger Bands",
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "ticker": {"type": "string"},
-                "start_date": {"type": "string"},
-                "end_date": {"type": "string"},
-                "indicators": {"type": "string", "description": "逗号分隔的指标名"},
-            },
-            "required": ["ticker", "start_date", "end_date", "indicators"],
-        }),
-        |args| Box::pin(async move { get_indicators(&args).await }),
-    );
-}
+**模式 2 — 牛/熊辩论循环：**
+```
+输入: AgentState
+判断:
+  IF debate_state.count >= 2 * max_debate_rounds → Research Manager
+  ELSE IF current_response 以 "Bull" 开头 → Bear Researcher
+  ELSE → Bull Researcher
 ```
 
-### 工具执行循环
-
-对应 LangGraph 的 `ToolNode` + 条件边回到 agent：
-
-```rust
-/// 工具循环：Agent 和 ToolNode 之间来回，直到 LLM 不再要求调工具
-pub async fn agent_tool_loop(
-    llm: &dyn LlmClient,
-    tools: &ToolRegistry,
-    messages: &mut Vec<Message>,
-) -> Result<String> {
-    let tool_defs = tools.get_defs();
-
-    loop {
-        // Agent 调用 LLM（带工具绑定）
-        let response = llm.chat_with_tools(messages, &tool_defs).await?;
-
-        match &response.tool_calls {
-            Some(calls) if !calls.is_empty() => {
-                // 把 AI 消息加入历史
-                messages.push(response.clone());
-
-                // 执行每个工具调用
-                for tc in calls {
-                    let args: Value = serde_json::from_str(&tc.function.arguments)?;
-                    let result = tools.execute(&tc.function.name, args).await?;
-
-                    messages.push(Message::Tool {
-                        content: result,
-                        tool_call_id: tc.id.clone(),
-                    });
-                }
-                // 循环回到 LLM
-            }
-            _ => {
-                // LLM 给了文本回复，没有工具调用 → 结束循环
-                let content = response.content.clone().unwrap_or_default();
-                messages.push(response);
-                return Ok(content);
-            }
-        }
-    }
-}
+**模式 3 — 风险三角辩论循环：**
+```
+输入: AgentState
+判断:
+  IF risk_state.count >= 3 * max_risk_discuss_rounds → Portfolio Manager
+  ELSE IF latest_speaker == "Aggressive" → Conservative Analyst
+  ELSE IF latest_speaker == "Conservative" → Neutral Analyst
+  ELSE → Aggressive Analyst
 ```
 
-这样，一个 Analyst 节点就是：准备 messages → 调 `agent_tool_loop()` → 得到报告文本。
+#### FR-1.4 状态传播
+
+- **FR-1.4.1**: 所有节点共享一个可变状态对象
+- **FR-1.4.2**: 每个节点返回状态更新（部分更新），图引擎负责合并
+- **FR-1.4.3**: 状态必须支持序列化/反序列化（用于 checkpoint）
+
+#### FR-1.5 执行模式
+
+- **FR-1.5.1**: 必须支持**流式执行**（逐节点输出中间状态，用于 UI 实时更新）
+- **FR-1.5.2**: 必须支持**批量执行**（返回到达 END 后的最终状态）
+- **FR-1.5.3**: 必须支持**递归深度限制**（可配置，防止无限循环）
+- **FR-1.5.4**: 必须支持**消息去重**（基于消息 ID，防止流式模式下重复处理）
+
+#### FR-1.6 消息管理
+
+- **FR-1.6.1**: 支持消息追加（AI/人类/工具/系统消息）
+- **FR-1.6.2**: 支持消息批量删除（用于分析师间清理上下文）
+- **FR-1.6.3**: 删除消息后必须插入最小占位消息（"Continue"），以满足 Anthropic API 要求（不允许空的 messages 列表）
 
 ---
 
-## Structured Output：Typed 输出
+### 3.2 LLM 客户端层
 
-Python 版用 Pydantic v2 + `with_structured_output()`。Rust 版用 `serde` + JSON mode：
+#### FR-2.1 多提供商支持
 
-### Schema 定义
+系统必须支持以下 10 个 LLM 提供商，并能通过配置切换：
 
-```rust
-use serde::{Deserialize, Serialize};
+| # | 提供商 | API 类型 | 默认端点 | 认证 Env Var | 特殊需求 |
+|---|--------|----------|----------|-------------|----------|
+| 1 | **OpenAI** | Responses API (`/v1/responses`) | `api.openai.com` | `OPENAI_API_KEY` | `reasoning_effort` 参数; 结构化输出用 `json_schema` |
+| 2 | **Anthropic** | Messages API | `api.anthropic.com` | `ANTHROPIC_API_KEY` | `effort` 参数; 结构化输出用 tool-use; content 是数组格式 |
+| 3 | **Google** | Gemini API | `generativelanguage.googleapis.com` | `GOOGLE_API_KEY` | `thinking_level` (Gemini 3) / `thinking_budget` (Gemini 2.5) |
+| 4 | **xAI** | OpenAI-compatible `/v1` | `api.x.ai` | `XAI_API_KEY` | 标准 Chat Completions |
+| 5 | **DeepSeek** | OpenAI-compatible `/v1` | `api.deepseek.com` | `DEEPSEEK_API_KEY` | **thinking-mode 回传** (见 FR-2.8) |
+| 6 | **Qwen** | OpenAI-compatible `/v1` | `dashscope-intl.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` | — |
+| 7 | **GLM** | OpenAI-compatible `/v1` | `api.z.ai/api/paas/v4/` | `ZHIPU_API_KEY` | — |
+| 8 | **OpenRouter** | OpenAI-compatible `/v1` | `openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | — |
+| 9 | **Ollama** | OpenAI-compatible `/v1` | `localhost:11434/v1` | 无 | 结构化输出可能不可用，需自动降级 |
+| 10 | **Azure** | Azure OpenAI | 用户指定 | Azure 认证 | 需 `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT`, `OPENAI_API_VERSION` |
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PortfolioRating {
-    Buy,
-    Overweight,
-    Hold,
-    Underweight,
-    Sell,
-}
+#### FR-2.2 统一 LLM 接口
 
-// ==================== ResearchPlan ====================
+所有提供商必须实现统一的调用接口：
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResearchPlan {
-    pub recommendation: PortfolioRating,
-    pub rationale: String,
-    pub strategic_actions: String,
-}
+```
+接口: LlmClient
+方法:
+  + chat(messages: List<Message>) -> Response
+      基础对话：发送消息列表，返回 AI 响应
 
-impl ResearchPlan {
-    /// 渲染为 markdown（给下游节点消费）
-    pub fn render(&self) -> String {
-        format!(
-            "**Recommendation**: {}\n\n**Rationale**:\n{}\n\n**Strategic Actions**:\n{}",
-            format!("{:?}", self.recommendation),
-            self.rationale,
-            self.strategic_actions,
-        )
-    }
-}
+  + chat_with_tools(messages: List<Message>, tools: List<ToolDef>) -> Response
+      带工具绑定的对话：发送消息+工具定义，返回 AI 响应（可能包含 tool_calls）
 
-// ==================== TraderProposal ====================
+  + chat_structured<T: Schema>(messages: List<Message>, schema: JsonSchema) -> T
+      结构化输出：发送消息+schema，返回反序列化的类型实例
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TraderAction {
-    Buy,
-    Hold,
-    Sell,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TraderProposal {
-    pub action: TraderAction,
-    pub reasoning: String,
-    pub entry_price: Option<f64>,
-    pub stop_loss: Option<f64>,
-    pub position_sizing: Option<String>,
-}
-
-// ==================== PortfolioDecision ====================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PortfolioDecision {
-    pub rating: PortfolioRating,
-    pub executive_summary: String,
-    pub investment_thesis: String,
-    pub price_target: Option<f64>,
-    pub time_horizon: Option<String>,
-}
+  + validate_model() -> bool
+      模型名称校验：检查是否在已知模型列表中
 ```
 
-### 结构化输出调用
+#### FR-2.3 内容规范化
 
-```rust
-/// 尝试结构化输出，失败回退到自由文本
-pub async fn invoke_structured_or_freetext<T: DeserializeOwned>(
-    structured_llm: &dyn LlmClient,
-    plain_llm: &dyn LlmClient,
-    messages: &[Message],
-    schema_name: &str,
-    agent_name: &str,
-) -> Result<T> {
-    let schema = generate_json_schema::<T>(schema_name);
+- **FR-2.3.1**: 所有提供商的 `response.content` 必须归一化为纯文本字符串
+- **FR-2.3.2**: 对于返回列表结构内容的提供商（OpenAI Responses API、Gemini 3），必须提取并拼接所有 `type: "text"` 块的内容
+- **FR-2.3.3**: 非文本块（如 reasoning/metadata）应在归一化过程中丢弃
 
-    match structured_llm.chat_structured::<T>(messages, schema).await {
-        Ok(result) => Ok(result),
-        Err(e) => {
-            log::warn!("{agent_name} structured output failed ({e}), falling back to free-text");
-            // fallback: 用 plain_llm 做普通调用，自己解析
-            let text_response = plain_llm.chat(messages).await?;
-            // 尝试从文本中提取 JSON
-            extract_json_from_text::<T>(&text_response.content.unwrap_or_default())
-        }
-    }
-}
+#### FR-2.4 结构化输出支持
 
-/// 生成 JSON Schema（运行时用 serde_json::Value 表示）
-fn generate_json_schema<T: Serialize + DeserializeOwned>(name: &str) -> serde_json::Value {
-    // 用 schemars crate 或直接手写
-    // ...
-}
-```
+- **FR-2.4.1**: 系统必须支持通过 JSON Schema 约束 LLM 输出
+- **FR-2.4.2**: 对于不支持结构化输出的提供商/模型，必须**自动降级**为自由文本生成
+- **FR-2.4.3**: 降级时记录 WARNING 日志，不阻塞主流程
+- **FR-2.4.4**: 结构化输出调用失败时（JSON 解析错误等），应**自动重试一次**自由文本路径
+
+#### FR-2.5 自定义端点
+
+- **FR-2.5.1**: 所有提供商必须支持通过配置指定自定义 `base_url`
+- **FR-2.5.2**: 自定义 URL 优先级高于提供商默认 URL
+
+#### FR-2.6 双模型架构
+
+- **FR-2.6.1**: 系统必须维护两个独立的 LLM 客户端实例（快速 + 深度）
+- **FR-2.6.2**: 两个实例可以使用不同模型但必须使用**同一提供商**
+- **FR-2.6.3**: 必须支持提供商特定的思考参数配置（OpenAI `reasoning_effort`、Anthropic `effort`、Google `thinking_level`）
+
+#### FR-2.7 HTTP 客户端
+
+- **FR-2.7.1**: 必须支持自定义 HTTP 客户端注入（连接池、代理、TLS 配置）
+- **FR-2.7.2**: 必须内置重试逻辑（最少 3 次，指数退避：1s、2s、4s）
+- **FR-2.7.3**: 必须收集每次调用的 token 使用统计（输入/输出 token 数）
+
+#### FR-2.8 DeepSeek Thinking-Mode 特殊处理
+
+- **FR-2.8.1**: 当 DeepSeek 返回 `reasoning_content` 字段时，必须在下一轮请求中将该字段作为 assistant message 的一部分原样返回给 API
+- **FR-2.8.2**: 若不回传 `reasoning_content`，DeepSeek API 将返回 HTTP 400 错误
+- **FR-2.8.3**: `deepseek-reasoner` 模型不支持 `tool_choice`，结构化输出对该模型必须自动降级
+
+#### FR-2.9 模型目录
+
+- **FR-2.9.1**: 必须维护各提供商的已知模型列表（用于 CLI 选择器）
+- **FR-2.9.2**: 支持自定义模型 ID 输入（不在已知列表中时发出 Warning 但允许使用）
+- **FR-2.9.3**: Ollama 和 OpenRouter 不做模型名校验（任何模型名均接受）
 
 ---
 
-## 图执行引擎：硬编码的 StateGraph
+### 3.3 智能体系统
 
-这是 Rust 版最核心的设计差异。不再有一个通用的 `StateGraph` 框架，所有流程逻辑硬编码在一个函数中。但我们需要结构化的阶段跳转和断点续跑。
+#### FR-3.1 智能体清单
 
-### 阶段枚举（用于 checkpoint 路由）
+系统必须实现以下 12 个智能体：
 
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PipelineStage {
-    Init,
-    MarketAnalyst,
-    SocialAnalyst,
-    NewsAnalyst,
-    FundamentalsAnalyst,
-    BullResearcher,
-    BearResearcher,
-    ResearchManager,
-    Trader,
-    AggressiveRisk,
-    ConservativeRisk,
-    NeutralRisk,
-    PortfolioManager,
-    Done,
-}
+| # | 智能体 | 使用的模型 | 绑定工具 | 结构化输出 | 输出写入字段 |
+|---|--------|----------|---------|-----------|------------|
+| 1 | **Market Analyst** | Quick | `get_stock_data`, `get_indicators` | — | `market_report` |
+| 2 | **Social Media Analyst** | Quick | `get_news` | — | `sentiment_report` |
+| 3 | **News Analyst** | Quick | `get_news`, `get_global_news`, `get_insider_transactions` | — | `news_report` |
+| 4 | **Fundamentals Analyst** | Quick | `get_fundamentals`, `get_balance_sheet`, `get_cashflow`, `get_income_statement` | — | `fundamentals_report` |
+| 5 | **Bull Researcher** | Quick | — | — | `investment_debate_state` |
+| 6 | **Bear Researcher** | Quick | — | — | `investment_debate_state` |
+| 7 | **Research Manager** | Deep | — | `ResearchPlan` | `investment_plan` |
+| 8 | **Trader** | Quick | — | `TraderProposal` | `trader_investment_plan` |
+| 9 | **Aggressive Risk Analyst** | Quick | — | — | `risk_debate_state` |
+| 10 | **Conservative Risk Analyst** | Quick | — | — | `risk_debate_state` |
+| 11 | **Neutral Risk Analyst** | Quick | — | — | `risk_debate_state` |
+| 12 | **Portfolio Manager** | Deep | — | `PortfolioDecision` | `final_trade_decision` |
 
-impl PipelineStage {
-    /// 按顺序的下一个阶段
-    pub fn next(self) -> Option<Self> {
-        use PipelineStage::*;
-        match self {
-            Init => Some(MarketAnalyst),
-            MarketAnalyst => Some(SocialAnalyst),
-            SocialAnalyst => Some(NewsAnalyst),
-            NewsAnalyst => Some(FundamentalsAnalyst),
-            FundamentalsAnalyst => Some(BullResearcher),
-            // 辩论阶段的 next 由循环逻辑控制，不通过此方法
-            ResearchManager => Some(Trader),
-            Trader => Some(AggressiveRisk),
-            PortfolioManager => Some(Done),
-            Done => None,
-            _ => None,
-        }
-    }
-}
+#### FR-3.2 智能体分类模式
+
+所有 12 个智能体遵循以下三种模式之一：
+
+**类型 A — 带工具调用的分析师（Agent 1-4）：**
+```
+流程:
+  1. 从 AgentState 提取 company_of_interest, trade_date
+  2. 构建 instrument_context（保留交易所后缀 e.g. .TO, .HK）
+  3. 构建系统提示（含角色定义 + 工具描述 + 输出格式要求 + 语言指令）
+  4. 绑定工具到 LLM
+  5. 进入工具调用循环：LLM 返回 tool_calls → 执行工具 → 将结果加入 messages → 再次调用 LLM
+  6. 循环终止条件：LLM 返回纯文本（无 tool_calls）
+  7. 将最终文本写入对应报告字段
+  8. 要求输出包含 Markdown 表格（整理关键信息）
 ```
 
-### 节点 trait
-
-```rust
-#[async_trait]
-pub trait GraphNode: Send + Sync {
-    /// 节点名（用于日志和 checkpoint）
-    fn name(&self) -> &str;
-
-    /// 节点对应的阶段
-    fn stage(&self) -> PipelineStage;
-
-    /// 执行节点逻辑，返回（）或错误
-    async fn execute(&self, state: &mut AgentState, llm: &LlmPair) -> Result<()>;
-}
+**类型 B — 辩论参与者（Agent 5-6, 9-11）：**
+```
+流程:
+  1. 读取所有分析师报告（4个）和上游决策
+  2. 读取辩论历史和对方的最新论点
+  3. 构建辩论提示（含角色立场 + 反驳策略 + 论据来源）
+  4. 调用 LLM（无工具绑定）
+  5. 将新论点追加到辩论历史
+  6. 更新自己的 *_history 字段
+  7. 递增辩论计数
+  8. 发言人标识: "Bull Analyst:", "Bear Analyst:", "Aggressive Risk Analyst:" 等
 ```
 
-### 工具循环节点的通用实现
-
-所有四个 Analyst 节点的逻辑是完全一样的：`构造 system prompt → 进入 tool loop → 存储报告`。不同之处仅在于 system prompt 模板和工具集。
-
-```rust
-pub struct AnalystNode {
-    stage: PipelineStage,
-    name: String,
-    system_prompt_template: &'static str,
-    tools: ToolRegistry,
-    report_field: ReportField, // 标记写入 state 的哪个字段
-}
-
-#[async_trait]
-impl GraphNode for AnalystNode {
-    fn name(&self) -> &str { &self.name }
-    fn stage(&self) -> PipelineStage { self.stage }
-
-    async fn execute(&self, state: &mut AgentState, llm: &LlmPair) -> Result<()> {
-        let prompt = self.system_prompt_template
-            .replace("{ticker}", &state.company_of_interest)
-            .replace("{date}", &state.trade_date);
-
-        let mut messages = vec![
-            Message::System { content: prompt },
-            Message::Human {
-                content: format!("分析 {} 在 {} 的情况", state.company_of_interest, state.trade_date),
-            },
-        ];
-
-        // 工具循环
-        let report = agent_tool_loop(&*llm.quick, &self.tools, &mut messages).await?;
-
-        // 写入 state
-        self.report_field.write(state, report);
-
-        // 清空 messages（为了 Anthropic 兼容性，避免重复发送工具结果）
-        state.messages = vec![Message::Human { content: "Continue".into() }];
-
-        Ok(())
-    }
-}
+**类型 C — 结构化决策者（Agent 7-8, 12）：**
+```
+流程:
+  1. 读取上游输出（辩论历史/投资计划/交易计划等）
+  2. 构建决策提示（含评级体系说明 + 上下文）
+  3. 绑定结构化输出 schema
+  4. 调用 LLM 生成类型化输出
+  5. 渲染为 Markdown 文本
+  6. 写入对应状态字段
 ```
 
-### 流水线主函数
+#### FR-3.3 提示管理
 
-```rust
-pub async fn run_pipeline(
-    state: &mut AgentState,
-    llm: &LlmPair,
-    config: &Config,
-    checkpointer: &Option<Checkpointer>,
-) -> Result<PortfolioDecision> {
-    // 如果是断点续跑，从 checkpoint 恢复 stage
-    let start_stage = if let Some(cp) = checkpointer {
-        cp.get_current_stage().unwrap_or(PipelineStage::Init)
-    } else {
-        PipelineStage::Init
-    };
+- **FR-3.3.1**: 所有智能体的系统提示必须从代码中**分离**，存储在外部文件中
+- **FR-3.3.2**: 提示必须支持**变量插值**（至少支持 `{company_of_interest}`, `{trade_date}`, `{report}`, `{history}`, `{current_response}` 等占位符）
+- **FR-3.3.3**: 提示修改不需要重新编译
+- **FR-3.3.4**: 必须支持多语言输出指令（`get_language_instruction()` 逻辑）
 
-    let nodes: Vec<Box<dyn GraphNode>> = build_nodes(config);
+#### FR-3.4 智能体选择
 
-    let mut stage = start_stage;
-    while stage != PipelineStage::Done {
-        // 找到对应节点
-        let node = nodes.iter().find(|n| n.stage() == stage)
-            .ok_or_else(|| anyhow::anyhow!("No node for stage {:?}", stage))?;
+- **FR-3.4.1**: 四个分析师可选配（用户可任意组合，如仅选 Market + News）
+- **FR-3.4.2**: 其余 8 个智能体固定执行，不可跳过
+- **FR-3.4.3**: 若未选择任何分析师，必须报错
 
-        println!("[{}] Running...", node.name());
+#### FR-3.5 工具调用循环
 
-        // 执行节点
-        node.execute(state, llm).await?;
-
-        // 保存 checkpoint
-        if let Some(cp) = checkpointer {
-            cp.save(stage, state).await?;
-        }
-
-        // 推进 stage
-        stage = next_stage(stage, state, config);
-    }
-
-    // 解析最终决策
-    let decision: PortfolioDecision = serde_json::from_str(&state.final_trade_decision)?;
-    Ok(decision)
-}
-
-/// 决定下一个阶段（包含辩论循环的条件逻辑）
-fn next_stage(current: PipelineStage, state: &AgentState, config: &Config) -> PipelineStage {
-    use PipelineStage::*;
-
-    match current {
-        // Analyst 链：跳过未选中的 analyst
-        MarketAnalyst if !config.selected_analysts.contains(&"market") => SocialAnalyst,
-        SocialAnalyst if !config.selected_analysts.contains(&"social") => NewsAnalyst,
-        NewsAnalyst if !config.selected_analysts.contains(&"news") => FundamentalsAnalyst,
-        FundamentalsAnalyst if !config.selected_analysts.contains(&"fundamentals") => BullResearcher,
-
-        // 投资辩论循环
-        BullResearcher => {
-            let debate = &state.investment_debate_state;
-            if debate.count >= 2 * config.max_debate_rounds as i32 {
-                ResearchManager
-            } else {
-                BearResearcher  // Bear 回应
-            }
-        }
-        BearResearcher => {
-            let debate = &state.investment_debate_state;
-            if debate.count >= 2 * config.max_debate_rounds as i32 {
-                ResearchManager
-            } else {
-                BullResearcher  // Bull 回应
-            }
-        }
-
-        // 风险辩论循环（三角循环）
-        AggressiveRisk => {
-            let debate = &state.risk_debate_state;
-            if debate.count >= 3 * config.max_risk_discuss_rounds as i32 {
-                PortfolioManager
-            } else {
-                ConservativeRisk
-            }
-        }
-        ConservativeRisk => {
-            let debate = &state.risk_debate_state;
-            if debate.count >= 3 * config.max_risk_discuss_rounds as i32 {
-                PortfolioManager
-            } else {
-                NeutralRisk
-            }
-        }
-        NeutralRisk => {
-            let debate = &state.risk_debate_state;
-            if debate.count >= 3 * config.max_risk_discuss_rounds as i32 {
-                PortfolioManager
-            } else {
-                AggressiveRisk
-            }
-        }
-
-        // 其他阶段线性递进
-        current => current.next().unwrap_or(Done),
-    }
-}
-```
+- **FR-3.5.1**: 工具调用循环必须在通用逻辑中实现，而非在每个分析师中重复
+- **FR-3.5.2**: 循环终止条件：LLM 返回的消息中 `tool_calls` 为空或不存在
+- **FR-3.5.3**: 每次工具调用结果以 `ToolMessage` 形式追加到消息历史
+- **FR-3.5.4**: 工具调用循环必须有最大迭代次数限制（防止无限循环）
 
 ---
 
-## Agent 状态定义
+### 3.4 工具与数据源
 
-```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentState {
-    // --- 基础信息 ---
-    pub company_of_interest: String,
-    pub trade_date: String,
-    pub sender: String,
-    pub messages: Vec<Message>,
+#### FR-4.1 工具清单
 
-    // --- 分析师报告 ---
-    pub market_report: String,
-    pub sentiment_report: String,
-    pub news_report: String,
-    pub fundamentals_report: String,
+系统必须实现以下 9 个数据获取工具（作为 LLM Function Calling 工具）：
 
-    // --- 投资辩论 ---
-    pub investment_debate_state: InvestDebateState,
-    pub investment_plan: String,
+```
+类别: core_stock_apis (核心行情)
+├── get_stock_data(symbol, start_date, end_date) → OHLCV 数据 (CSV 格式)
 
-    // --- 交易计划 ---
-    pub trader_investment_plan: String,
+类别: technical_indicators (技术指标)
+├── get_indicators(symbol, indicator, curr_date, look_back_days) → 指标值序列
 
-    // --- 风险辩论 ---
-    pub risk_debate_state: RiskDebateState,
-    pub final_trade_decision: String,
+类别: fundamental_data (基本面)
+├── get_fundamentals(ticker, curr_date) → 公司基本面摘要 (28个字段)
+├── get_balance_sheet(ticker, freq, curr_date) → 资产负债表 (CSV)
+├── get_cashflow(ticker, freq, curr_date) → 现金流表 (CSV)
+├── get_income_statement(ticker, freq, curr_date) → 利润表 (CSV)
 
-    // --- 记忆 ---
-    pub past_context: String,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct InvestDebateState {
-    pub bull_history: String,
-    pub bear_history: String,
-    pub history: String,
-    pub current_response: String,
-    pub judge_decision: String,
-    pub count: i32,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RiskDebateState {
-    pub aggressive_history: String,
-    pub conservative_history: String,
-    pub neutral_history: String,
-    pub history: String,
-    pub latest_speaker: String,
-    pub current_aggressive_response: String,
-    pub current_conservative_response: String,
-    pub current_neutral_response: String,
-    pub judge_decision: String,
-    pub count: i32,
-}
+类别: news_data (新闻与事件)
+├── get_news(ticker, start_date, end_date) → 公司新闻
+├── get_global_news(curr_date, look_back_days, limit) → 全球宏观新闻
+└── get_insider_transactions(ticker) → 内部交易数据 (CSV)
 ```
 
-Python 版 `AgentState` 继承 `MessagesState` 以获得特殊的消息累加 reducer。Rust 版不需要 reducer——因为每个 analyst 执行完毕后我们直接 `state.messages = vec![HumanMessage("Continue")]` 清空消息列表。辩论节点手动 append 到 `history` 字段而非依赖 messages 累加。
+#### FR-4.2 工具-智能体绑定
+
+| 智能体 | 绑定的工具 |
+|--------|----------|
+| Market Analyst | `get_stock_data`, `get_indicators` |
+| Social Media Analyst | `get_news` |
+| News Analyst | `get_news`, `get_global_news`, `get_insider_transactions` |
+| Fundamentals Analyst | `get_fundamentals`, `get_balance_sheet`, `get_cashflow`, `get_income_statement` |
+
+#### FR-4.3 技术指标
+
+支持的 13 个技术指标（通过 yfinance/stockstats 计算）：
+
+| 类别 | 指标名 | 说明 |
+|------|--------|------|
+| 移动平均 | `close_50_sma` | 50日简单移动平均 |
+| 移动平均 | `close_200_sma` | 200日简单移动平均 |
+| 移动平均 | `close_10_ema` | 10日指数移动平均 |
+| MACD | `macd` | MACD 线 |
+| MACD | `macds` | MACD 信号线 |
+| MACD | `macdh` | MACD 柱状图 |
+| 动量 | `rsi` | 相对强弱指标 |
+| 动量 | `mfi` | 资金流量指标 |
+| 波动性 | `boll` | 布林带中轨 (20 SMA) |
+| 波动性 | `boll_ub` | 布林带上轨 |
+| 波动性 | `boll_lb` | 布林带下轨 |
+| 波动性 | `atr` | 平均真实波幅 |
+| 成交量 | `vwma` | 成交量加权移动平均 |
+
+每个指标必须附带：指标描述文本、使用建议、注意事项。
+
+#### FR-4.4 数据供应商
+
+**FR-4.4.1**: 必须支持至少两个数据供应商：
+
+| 供应商 | 数据来源 | 认证需求 | 速率限制 |
+|--------|---------|---------|---------|
+| **yfinance** | Yahoo Finance (公开 HTTP API) | 无 | 有 (`YFRateLimitError`) |
+| **Alpha Vantage** | Alpha Vantage API | `ALPHA_VANTAGE_API_KEY` | 严格（免费版 25 req/day） |
+
+**FR-4.4.2**: 必须支持按数据类别配置供应商（`data_vendors` 配置）：
+```text
+core_stock_apis:     "yfinance" | "alpha_vantage"
+technical_indicators: "yfinance" | "alpha_vantage"
+fundamental_data:     "yfinance" | "alpha_vantage"
+news_data:            "yfinance" | "alpha_vantage"
+```
+
+**FR-4.4.3**: 必须支持按工具级别覆盖供应商配置（`tool_vendors` 配置）：
+```text
+e.g. "get_stock_data": "alpha_vantage"  # 仅该工具使用 alpha_vantage
+```
+
+#### FR-4.5 供应商路由与回退
+
+- **FR-4.5.1**: 当主供应商因**速率限制**（`AlphaVantageRateLimitError` / `YFRateLimitError`）失败时，必须自动切换到备用供应商
+- **FR-4.5.2**: 其他类型的错误（网络错误、数据不存在等）不应触发回退，直接向上传播
+- **FR-4.5.3**: 回退链顺序：配置的主供应商 → 配置中列出的其他供应商 → 所有其余可用供应商
+- **FR-4.5.4**: 所有供应商均失败时，抛出明确的错误信息
+
+#### FR-4.6 数据缓存
+
+- **FR-4.6.1**: OHLCV 数据必须缓存到本地文件（减少重复网络请求）
+- **FR-4.6.2**: 缓存按 ticker 组织，存储在 `data_cache_dir`
+- **FR-4.6.3**: 缓存必须有过期策略
+
+#### FR-4.7 防止前视偏差
+
+- **FR-4.7.1**: 所有数据获取必须按 `trade_date` 过滤，LLM 不能看到未来数据
+- **FR-4.7.2**: 财务报表数据必须过滤掉 `trade_date` 之后的列
+- **FR-4.7.3**: OHLCV 数据加载只包含 `trade_date` 之前的历史
 
 ---
 
-## Analyst 节点 + 工具循环
+### 3.5 结构化输出
 
-四个分析师节点的构建函数：
+#### FR-5.1 三个结构化模式
 
-```rust
-fn build_analyst_nodes(config: &Config, data_vendor: &DataVendor) -> Vec<Box<dyn GraphNode>> {
-    let mut nodes: Vec<Box<dyn GraphNode>> = Vec::new();
+**ResearchPlan** (研究经理):
+```text
+字段:
+  - recommendation: enum {Buy, Overweight, Hold, Underweight, Sell}
+  - rationale: string (自然语言推理，对话风格)
+  - strategic_actions: string (给交易员的行动方案)
 
-    for analyst_type in &config.selected_analysts {
-        let (stage, name, prompt, tools) = match analyst_type.as_str() {
-            "market" => (
-                PipelineStage::MarketAnalyst,
-                "Market Analyst",
-                include_str!("../prompts/market_analyst.md"),
-                create_market_tools(data_vendor),
-            ),
-            "social" => (
-                PipelineStage::SocialAnalyst,
-                "Social Media Analyst",
-                include_str!("../prompts/social_media_analyst.md"),
-                create_social_tools(data_vendor),
-            ),
-            "news" => (
-                PipelineStage::NewsAnalyst,
-                "News Analyst",
-                include_str!("../prompts/news_analyst.md"),
-                create_news_tools(data_vendor),
-            ),
-            "fundamentals" => (
-                PipelineStage::FundamentalsAnalyst,
-                "Fundamentals Analyst",
-                include_str!("../prompts/fundamentals_analyst.md"),
-                create_fundamentals_tools(data_vendor),
-            ),
-            _ => continue,
-        };
-
-        nodes.push(Box::new(AnalystNode::new(stage, name, prompt, tools, analyst_type)));
-    }
-
-    nodes
-}
+渲染格式:
+  **Recommendation**: {recommendation}
+  **Rationale**: {rationale}
+  **Strategic Actions**: {strategic_actions}
 ```
 
-每个 analyst 的 `execute()` 流程（前面已展示）完全一致，差异仅在于 prompt 和 tool set。这比 Python 版更简洁——Python 版为了 LangGraph 的节点函数签名，每个 analyst 都是一个独立文件。
+**TraderProposal** (交易员):
+```text
+字段:
+  - action: enum {Buy, Hold, Sell}
+  - reasoning: string (2-4句推理)
+  - entry_price: float? (入场价)
+  - stop_loss: float? (止损价)
+  - position_sizing: string? (仓位建议, e.g. "5% of portfolio")
+
+渲染格式:
+  **Action**: {action}
+  **Reasoning**: {reasoning}
+  [**Entry Price**: {entry_price}]
+  [**Stop Loss**: {stop_loss}]
+  [**Position Sizing**: {position_sizing}]
+  FINAL TRANSACTION PROPOSAL: **{ACTION}**
+```
+
+**PortfolioDecision** (投资组合经理):
+```text
+字段:
+  - rating: enum {Buy, Overweight, Hold, Underweight, Sell}
+  - executive_summary: string (2-4句行动计划)
+  - investment_thesis: string (详细推理，锚定分析师证据)
+  - price_target: float? (目标价)
+  - time_horizon: string? (持有期, e.g. "3-6 months")
+
+渲染格式:
+  **Rating**: {rating}
+  **Executive Summary**: {executive_summary}
+  **Investment Thesis**: {investment_thesis}
+  [**Price Target**: {price_target}]
+  [**Time Horizon**: {time_horizon}]
+```
+
+#### FR-5.2 模式管理
+
+- **FR-5.2.1**: 每个模式必须有对应的 JSON Schema 生成能力
+- **FR-5.2.2**: 每个模式必须有 Markdown 渲染函数
+- **FR-5.2.3**: 渲染后的 Markdown 必须保持向后兼容（下游消费者和记忆日志依赖固定格式）
+
+#### FR-5.3 优雅降级路径
+
+```
+优先级 1: structured_llm.invoke(prompt, schema) → 解析为类型实例 → render()
+优先级 2 (降级): plain_llm.invoke(prompt) → 自由文本 → 直接使用 content
+```
+
+降级触发条件：
+- 提供商不支持结构化输出（e.g. Ollama 旧模型）
+- `deepseek-reasoner` 模型（无 `tool_choice` 支持）
+- JSON 解析失败（弱模型输出格式不正确）
+- API 返回异常
 
 ---
 
-## 辩论循环：Bull vs Bear
+### 3.6 决策记忆日志
 
-### Bull Researcher
+#### FR-6.1 存储格式
 
-```rust
-pub struct BullResearcherNode;
+- **FR-6.1.1**: 记忆日志必须以**追加式 Markdown 文件**存储
+- **FR-6.1.2**: 文件路径默认为 `~/.tradingagents/memory/trading_memory.md`（可通过环境变量/配置覆盖）
+- **FR-6.1.3**: 使用 HTML 注释 `<!-- ENTRY_END -->` 作为条目分隔符（LLM 输出中不会出现的硬分隔符）
 
-#[async_trait]
-impl GraphNode for BullResearcherNode {
-    fn name(&self) -> &str { "Bull Researcher" }
-    fn stage(&self) -> PipelineStage { PipelineStage::BullResearcher }
+#### FR-6.2 日志条目格式
 
-    async fn execute(&self, state: &mut AgentState, llm: &LlmPair) -> Result<()> {
-        let debate = &state.investment_debate_state;
+```
+[{date} | {ticker} | {rating} | {status_or_return} | {alpha} | {holding_days}d]
 
-        // 构造 prompt：包含所有分析师报告、历史辩论记录、最后一条发言
-        let prompt = BullResearcherPrompt::build(
-            &state.market_report,
-            &state.sentiment_report,
-            &state.news_report,
-            &state.fundamentals_report,
-            &debate.history,
-            &debate.current_response,
-        );
+DECISION:
+{final_trade_decision 的完整 Markdown}
 
-        let messages = vec![
-            Message::System { content: prompt },
-            Message::Human { content: "Present your bullish argument.".into() },
-        ];
+REFLECTION:
+{反思文本}
 
-        let response = llm.quick.chat(&messages).await?;
-        let content = response.content.unwrap_or_default();
-        let bull_argument = format!("Bull Analyst:\n{}\n---", content);
-
-        // 更新 state
-        let mut new_debate = debate.clone();
-        new_debate.bull_history = format!("{}{}", debate.bull_history, bull_argument);
-        new_debate.history = format!("{}{}", debate.history, bull_argument);
-        new_debate.current_response = bull_argument;
-        new_debate.count += 1;
-
-        state.investment_debate_state = new_debate;
-        state.sender = "Bull Researcher".into();
-
-        Ok(())
-    }
-}
+<!-- ENTRY_END -->
 ```
 
-Bear Researcher 结构完全对称，只是把 `bull_history` 换成 `bear_history`，前缀换成 `"Bear Analyst:"`，`current_response` 使用正确的前缀。
+Tag 行字段（管道分隔）：
+1. `date` — 交易日期 (YYYY-MM-DD)
+2. `ticker` — 股票代码
+3. `rating` — 评级 (Buy/Overweight/Hold/Underweight/Sell)
+4. 状态 — `pending` 或原始收益率 (e.g. `+3.2%`)
+5. alpha — `pending` 或 Alpha vs SPY (e.g. `+1.5%`)
+6. 持有天数 — `pending` 或 `5d`
 
-### Research Manager（裁判）
+#### FR-6.3 两阶段生命周期
 
-```rust
-pub struct ResearchManagerNode;
+**Phase A — 存储决策（`store_decision`）：**
 
-#[async_trait]
-impl GraphNode for ResearchManagerNode {
-    fn name(&self) -> &str { "Research Manager" }
-    fn stage(&self) -> PipelineStage { PipelineStage::ResearchManager }
+执行时机: `propagate()` 完成时（每次分析运行结束时）
 
-    async fn execute(&self, state: &mut AgentState, llm: &LlmPair) -> Result<()> {
-        let debate = &state.investment_debate_state;
+- FR-6.3.1: 从 PM 的 `final_trade_decision` 文本中提取评级
+- FR-6.3.2: 构建 `[date | ticker | rating | pending]` tag
+- FR-6.3.3: 以追加模式写入日志文件（tag + DECISION section）
+- FR-6.3.4: **幂等性保证**：若文件中已存在相同 `[date | ticker | pending]` 条目，则跳过（防止重复写入）
 
-        let prompt = ResearchManagerPrompt::build(
-            &state.company_of_interest,
-            &state.trade_date,
-            &state.market_report,
-            &state.sentiment_report,
-            &state.news_report,
-            &state.fundamentals_report,
-            &debate.history,
-        );
+**Phase B — 解析结果（`batch_update_with_outcomes`）：**
 
-        let messages = vec![Message::System { content: prompt }];
+执行时机: 下一次同 ticker 的 `propagate()` 开始时
 
-        // 结构化输出
-        let plan: ResearchPlan = invoke_structured_or_freetext(
-            &*llm.deep, &*llm.deep, &messages, "research_plan", "ResearchManager",
-        ).await?;
+- FR-6.3.5: 加载所有 `pending` 条目
+- FR-6.3.6: 仅为**同 ticker** 的 pending 条目获取实际收益数据（通过 yfinance）
+- FR-6.3.7: 对每个条目调用 LLM 生成反思
+- FR-6.3.8: 批量原子更新所有条目（更新 tag + 追加 REFLECTION section）
+- FR-6.3.9: **原子写入保证**：先写临时文件，再 `rename` 替换原文件（防止写入中途崩溃导致文件损坏）
 
-        state.investment_plan = plan.render();
-        let mut new_debate = debate.clone();
-        new_debate.judge_decision = plan.render();
-        state.investment_debate_state = new_debate;
-        state.sender = "Research Manager".into();
+#### FR-6.4 上下文注入
 
-        Ok(())
-    }
-}
-```
+- **FR-6.4.1**: `get_past_context(ticker)` 在每次运行时提取历史经验
+- **FR-6.4.2**: 同 ticker 条目：最多 5 条，包含完整决策 + 反思
+- **FR-6.4.3**: 跨 ticker 条目：最多 3 条，仅包含反思摘要
+- **FR-6.4.4**: 提取的上下文注入到 Portfolio Manager 的提示中
+
+#### FR-6.5 日志轮换
+
+- **FR-6.5.1**: 当 `memory_log_max_entries` 配置为数值时，已解析条目数量超过该值则删除最旧的
+- **FR-6.5.2**: **Pending 条目永不被删除**（代表未完成的工作）
+- **FR-6.5.3**: `memory_log_max_entries` 为 `null/None` 时，禁用轮换
+
+#### FR-6.6 条目解析
+
+- **FR-6.6.1**: 必须从 Markdown 文本中正确解析 tag 行的各字段（管道分隔）
+- **FR-6.6.2**: 必须从正文中正确提取 DECISION 和 REFLECTION 部分
+- **FR-6.6.3**: 解析必须容忍格式变体（额外的空白、缺失的可选字段）
 
 ---
 
-## 风险管理辩论 + 最终决策
+### 3.7 事后反思
 
-### 风险辩论三角循环
+#### FR-7.1 反思生成
 
-三个风险分析师（AggressiveRisk、ConservativeRisk、NeutralRisk）结构完全对称，与 Bull/Bear 辩论类似：
+- **FR-7.1.1**: 反思使用 `quick_thinking_llm` 生成（节省成本）
+- **FR-7.1.2**: 反思必须覆盖三个要点：
+  1. 方向性判断是否正确？（引用 Alpha 数据）
+  2. 投资论文的哪部分成立/失败？
+  3. 一个具体可操作的教训
+- **FR-7.1.3**: 反思输出为 2-4 句纯文本（无列表、无标题、无 Markdown）
+- **FR-7.1.4**: 反思内容紧凑，适合注入到未来 LLM 提示的上下文中
 
-- 每个收到：四个分析师报告 + `trader_investment_plan` + `history` + **最近两个对手的发言**
-- 每个追加自己的论点到 `history` 和自己的 `*_history` 字段
-- `count` 递增，`latest_speaker` 更新
+#### FR-7.2 收益计算
 
-```rust
-pub struct AggressiveRiskNode;
+- **FR-7.2.1**: 计算 `raw_return = (close[N] - close[0]) / close[0]`，默认 N=5 天
+- **FR-7.2.2**: 计算 `alpha = raw_return - spy_return`（SPY 作为基准）
+- **FR-7.2.3**: 若价格数据不可用（太新、退市、网络错误），返回 None 并在下次运行时重试
+- **FR-7.2.4**: 数据获取使用 yfinance（不依赖配置的数据供应商，因为收益计算是内部逻辑）
 
-#[async_trait]
-impl GraphNode for AggressiveRiskNode {
-    fn name(&self) -> &str { "Aggressive Risk Analyst" }
-    fn stage(&self) -> PipelineStage { PipelineStage::AggressiveRisk }
+#### FR-7.3 反思失败处理
 
-    async fn execute(&self, state: &mut AgentState, llm: &LlmPair) -> Result<()> {
-        let risk = &state.risk_debate_state;
+- **FR-7.3.1**: LLM 反思调用失败时，应重试（至少 3 次）
+- **FR-7.3.2**: 反思失败不应阻塞主分析流程（该条目保持 pending 状态）
 
-        let prompt = RiskAnalystPrompt::build(
-            "aggressive",
-            &state.market_report,
-            &state.sentiment_report,
-            &state.news_report,
-            &state.fundamentals_report,
-            &state.trader_investment_plan,
-            &risk.history,
-            &risk.current_conservative_response,
-            &risk.current_neutral_response,
-        );
+---
 
-        let messages = vec![
-            Message::System { content: prompt },
-            Message::Human { content: "Present your aggressive risk argument.".into() },
-        ];
+### 3.8 断点续跑
 
-        let response = llm.quick.chat(&messages).await?;
-        let content = response.content.unwrap_or_default();
-        let argument = format!("Aggressive Risk Analyst:\n{}\n---", content);
+#### FR-8.1 检查点存储
 
-        let mut new_risk = risk.clone();
-        new_risk.aggressive_history = format!("{}{}", risk.aggressive_history, argument);
-        new_risk.history = format!("{}{}", risk.history, argument);
-        new_risk.current_aggressive_response = argument;
-        new_risk.latest_speaker = "Aggressive".into();
-        new_risk.count += 1;
+- **FR-8.1.1**: 检查点默认存储为 SQLite 数据库（每个 ticker 一个独立 DB 文件）
+- **FR-8.1.2**: 存储位置：`{data_cache_dir}/checkpoints/{TICKER}.db`
+- **FR-8.1.3**: Thread ID 必须是确定性的：`SHA256(ticker_upper:date)[:16]`
+- **FR-8.1.4**: 检查点启用通过 `checkpoint_enabled` 配置控制
 
-        state.risk_debate_state = new_risk;
-        state.sender = "Aggressive Risk Analyst".into();
+#### FR-8.2 检查点生命周期
 
-        Ok(())
-    }
+```
+每个节点执行完成后 → save_checkpoint(stage, state)
+整个 Pipeline 执行成功 → clear_checkpoint(ticker, date)
+执行中崩溃/中断 → checkpoint 保留（用于下次 resume）
+```
+
+#### FR-8.3 断点恢复
+
+- **FR-8.3.1**: `propagate()` 启动时检查是否存在同 ticker+date 的 checkpoint
+- **FR-8.3.2**: 若存在：加载保存的状态，从保存的 stage 继续执行
+- **FR-8.3.3**: 若不存在：从初始状态开始执行
+- **FR-8.3.4**: 恢复后，已完成的节点不再重新执行
+
+#### FR-8.4 检查点管理
+
+- **FR-8.4.1**: 支持清除单个 ticker+date 的检查点
+- **FR-8.4.2**: 支持清除所有检查点
+- **FR-8.4.3**: 成功完成分析后自动清除检查点
+
+#### FR-8.5 状态序列化
+
+- **FR-8.5.1**: 完整的 `AgentState` 必须可序列化为 JSON
+- **FR-8.5.2**: 序列化后的状态必须能完整反序列化恢复
+- **FR-8.5.3**: 序列化不丢失关键信息（消息历史、辩论状态、报告内容）
+
+---
+
+### 3.9 CLI 交互界面
+
+#### FR-9.1 启动流程
+
+CLI 必须提供以下交互式输入步骤：
+
+| 步骤 | 提示 | 输入类型 | 默认值 | 校验 |
+|------|------|---------|--------|------|
+| 1 | Ticker Symbol | 文本输入 | SPY | 非空 |
+| 2 | Analysis Date | 日期输入 YYYY-MM-DD | 今天 | 不能是未来日期 |
+| 3 | Output Language | 单选 | English | — |
+| 4 | Analyst Selection | 多选 | 全选 | 至少选一个 |
+| 5 | Research Depth | 单选 | Shallow (1 round) | — |
+| 6 | LLM Provider | 单选 | OpenAI | — |
+| 7 | Quick-thinking Model | 单选 | 提供商默认 | — |
+| 8 | Deep-thinking Model | 单选 | 提供商默认 | — |
+| 9 | Thinking Config | 单选 (条件) | 无 | 仅当提供商支持时显示 |
+
+#### FR-9.2 实时仪表盘
+
+必须显示包含以下 5 个区域的 Live 界面：
+
+| 区域 | 内容 | 刷新频率 |
+|------|------|----------|
+| **Header** | 欢迎信息 + 版权 | 静态 |
+| **Progress** | 智能体状态表（5 团队 12 智能体），颜色编码：pending=黄 / in_progress=蓝(旋转) / completed=绿 / error=红 | 4 Hz |
+| **Messages** | 最近消息和工具调用（最新 12 条，含时间戳） | 4 Hz |
+| **Analysis** | 当前报告 Section（实时更新的 Markdown） | 4 Hz |
+| **Footer** | 统计条：智能体进度 | LLM 调用次数 | 工具调用次数 | Token 统计 | 报告进度 | 耗时 | 4 Hz |
+
+#### FR-9.3 状态追踪
+
+- **FR-9.3.1**: 必须自动从 stream chunks 推断智能体状态转换 (pending → in_progress → completed)
+- **FR-9.3.2**: 必须按 Section 追踪报告完成情况
+- **FR-9.3.3**: "报告完成"的判断标准：报告有内容 AND 该 Section 最终化智能体状态为 completed
+
+#### FR-9.4 统计收集
+
+- **FR-9.4.1**: 必须收集 LLM 调用总次数
+- **FR-9.4.2**: 必须收集工具调用总次数
+- **FR-9.4.3**: 必须收集 Token 使用统计（输入/输出）
+- **FR-9.4.4**: 必须记录总耗时（从 pipeline 开始到结束）
+
+#### FR-9.5 命令行参数
+
+```
+tradingagents analyze [OPTIONS]
+
+Options:
+  --checkpoint         启用断点续跑 (checkpoint 模式)
+  --clear-checkpoints  运行前清除所有已有检查点
+```
+
+#### FR-9.6 分析后交互
+
+- **FR-9.6.1**: 提示用户是否保存报告（Y/N），若保存则选择路径
+- **FR-9.6.2**: 提示用户是否在屏幕上显示完整报告（Y/N）
+- **FR-9.6.3**: 完整报告按 Section 依次展示（避免终端截断）
+
+#### FR-9.7 CLI 框架能力
+
+- **FR-9.7.1**: 必须支持 Shell 自动补全
+- **FR-9.7.2**: 必须支持帮助命令 (`--help`)
+- **FR-9.7.3**: 支持非交互模式（直接传参数跳过交互式问答）
+
+---
+
+### 3.10 报告生成
+
+#### FR-10.1 输出格式
+
+系统必须生成以下格式的报告：
+
+| 格式 | 内容 |
+|------|------|
+| **Markdown (.md)** | 各 Section 独立文件 + 完整合并文件 |
+| **HTML (.html)** | 各 Section 独立文件 + 完整合并文件 + 索引页面 |
+| **JSON** | 完整 AgentState 快照 |
+
+#### FR-10.2 文件结构
+
+```
+{save_path}/
+├── index.html                     # 索引页面（含目录链接）
+├── complete_report.md             # 完整报告（合并所有 Section）
+├── complete_report.html           # 完整报告 HTML
+├── 1_analysts/
+│   ├── market.md / market.html
+│   ├── sentiment.md / sentiment.html
+│   ├── news.md / news.html
+│   └── fundamentals.md / fundamentals.html
+├── 2_research/
+│   ├── bull.md / bull.html
+│   ├── bear.md / bear.html
+│   └── manager.md / manager.html
+├── 3_trading/
+│   └── trader.md / trader.html
+├── 4_risk/
+│   ├── aggressive.md / aggressive.html
+│   ├── conservative.md / conservative.html
+│   ├── neutral.md / neutral.html
+│   └── decision.md / decision.html
+└── 5_portfolio/
+    └── decision.md / decision.html
+```
+
+#### FR-10.3 HTML 要求
+
+- **FR-10.3.1**: 所有 CSS 必须内嵌（无外部依赖）
+- **FR-10.3.2**: 响应式布局（max-width: 900px）
+- **FR-10.3.3**: 表格有边框和交替行背景色
+- **FR-10.3.4**: 代码块有背景色和等宽字体
+- **FR-10.3.5**: 页面间有相对路径导航链接
+
+#### FR-10.4 JSON 状态日志
+
+```text
+路径: {results_dir}/{TICKER}/TradingAgentsStrategy_logs/full_states_log_{date}.json
+内容: AgentState 的完整 JSON 序列化（含所有报告、辩论状态、最终决策）
+```
+
+#### FR-10.5 CLI 消息日志
+
+```text
+路径: {results_dir}/{TICKER}/{date}/message_tool.log
+格式: [HH:MM:SS] [MessageType] content
+      [HH:MM:SS] [Tool Call] tool_name(key=value, ...)
+```
+
+#### FR-10.6 实时报告写入
+
+- **FR-10.6.1**: 分析进行中时，每个 Section 完成后立即写入对应 .md 文件
+- **FR-10.6.2**: 完整报告在 analysis 完成后生成
+
+#### FR-10.7 安全要求
+
+- **FR-10.7.1**: HTML 输出中的 LLM 生成内容必须转义（防止 XSS）
+- **FR-10.7.2**: ticker 值必须通过 `safe_ticker_component` 验证后才能用于文件路径
+
+---
+
+### 3.11 配置系统
+
+#### FR-11.1 配置项清单
+
+```text
+目录配置:
+  results_dir:  string          # 默认 ~/.tradingagents/logs (env: TRADINGAGENTS_RESULTS_DIR)
+  data_cache_dir: string        # 默认 ~/.tradingagents/cache (env: TRADINGAGENTS_CACHE_DIR)
+  memory_log_path: string       # 默认 ~/.tradingagents/memory/trading_memory.md (env: TRADINGAGENTS_MEMORY_LOG_PATH)
+
+LLM 配置:
+  llm_provider: string          # openai|anthropic|google|xai|deepseek|qwen|glm|openrouter|ollama|azure
+  deep_think_llm: string        # 深度思考模型 ID
+  quick_think_llm: string       # 快速思考模型 ID
+  backend_url: string|null      # 自定义 API 端点
+
+提供商特定:
+  google_thinking_level: string|null    # high|minimal|low|medium
+  openai_reasoning_effort: string|null  # high|medium|low
+  anthropic_effort: string|null         # high|medium|low
+
+工作流:
+  checkpoint_enabled: bool      # 默认 false
+  output_language: string       # 默认 "English"
+  max_debate_rounds: int        # 默认 1
+  max_risk_discuss_rounds: int  # 默认 1
+  max_recur_limit: int          # 默认 100
+
+记忆:
+  memory_log_max_entries: int|null  # null = 不轮换
+
+数据源:
+  data_vendors: map[string]string    # 类别→供应商
+  tool_vendors: map[string]string    # 工具→供应商 (覆盖类别配置)
+```
+
+#### FR-11.2 配置加载优先级
+
+```
+环境变量 > 配置文件 > 代码默认值
+```
+
+#### FR-11.3 环境变量
+
+```
+LLM 认证:
+  OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY
+  XAI_API_KEY, DEEPSEEK_API_KEY, DASHSCOPE_API_KEY
+  ZHIPU_API_KEY, OPENROUTER_API_KEY
+
+Azure:
+  AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT
+  AZURE_OPENAI_DEPLOYMENT_NAME, OPENAI_API_VERSION
+
+数据:
+  ALPHA_VANTAGE_API_KEY
+
+路径:
+  TRADINGAGENTS_CACHE_DIR, TRADINGAGENTS_RESULTS_DIR
+  TRADINGAGENTS_MEMORY_LOG_PATH
+```
+
+#### FR-11.4 配置安全
+
+- **FR-11.4.1**: API Keys 必须从环境变量或 `.env` 文件加载
+- **FR-11.4.2**: API Keys 绝对不能出现在日志/错误消息/报告输出中
+- **FR-11.4.3**: 配置中的敏感字段在序列化时必须屏蔽
+
+#### FR-11.5 配置运行时行为
+
+- **FR-11.5.1**: 配置在程序启动时一次性加载
+- **FR-11.5.2**: 运行时配置不可变（不需要支持热重载）
+- **FR-11.5.3**: 配置必须支持 `Clone`（可能在多线程间共享）
+
+---
+
+## 4. 数据模型
+
+### 4.1 全局状态结构
+
+```
+AgentState {
+    // === 基础标识 ===
+    messages: List<Message>               // 当前消息历史
+    company_of_interest: string           // 分析的股票代码（含交易所后缀）
+    trade_date: string                    // 分析日期 YYYY-MM-DD
+    sender: string                        // 最后发送消息的智能体名称
+    past_context: string                  // 从记忆日志提取的历史上下文
+
+    // === 分析师报告 (4个) ===
+    market_report: string                 // 市场技术分析报告
+    sentiment_report: string              // 社交媒体情绪报告
+    news_report: string                   // 新闻分析报告
+    fundamentals_report: string           // 基本面分析报告
+
+    // === 投资辩论 ===
+    investment_debate_state: InvestDebateState
+    investment_plan: string              // 研究经理的结构化输出渲染
+
+    // === 交易 ===
+    trader_investment_plan: string        // 交易员的结构化输出渲染
+
+    // === 风险辩论 ===
+    risk_debate_state: RiskDebateState
+    final_trade_decision: string          // PM 的结构化输出渲染
+}
+
+InvestDebateState {
+    bull_history: string                  // 牛市研究员的所有论点（累积）
+    bear_history: string                  // 熊市研究员的所有论点（累积）
+    history: string                       // 双方交替的完整对话历史
+    current_response: string              // 最新一条论点
+    judge_decision: string                // 研究经理的裁定
+    count: int                            // 辩论回合计数
+}
+
+RiskDebateState {
+    aggressive_history: string            // 激进分析师论点（累积）
+    conservative_history: string          // 保守分析师论点（累积）
+    neutral_history: string               // 中性分析师论点（累积）
+    history: string                       // 三方完整对话历史
+    latest_speaker: string                // 最近发言者："Aggressive"|"Conservative"|"Neutral"
+    current_aggressive_response: string    // 最新激进论点
+    current_conservative_response: string  // 最新保守论点
+    current_neutral_response: string       // 最新中性论点
+    judge_decision: string                // PM 最终决策
+    count: int                            // 辩论回合计数
 }
 ```
 
-### Portfolio Manager（最终决策者）
+### 4.2 消息类型
 
-```rust
-pub struct PortfolioManagerNode;
+```
+Message = SystemMessage | HumanMessage | AIMessage | ToolMessage
 
-#[async_trait]
-impl GraphNode for PortfolioManagerNode {
-    fn name(&self) -> &str { "Portfolio Manager" }
-    fn stage(&self) -> PipelineStage { PipelineStage::PortfolioManager }
+SystemMessage {
+    content: string
+}
 
-    async fn execute(&self, state: &mut AgentState, llm: &LlmPair) -> Result<()> {
-        let risk = &state.risk_debate_state;
+HumanMessage {
+    id: UUID
+    content: string
+}
 
-        let prompt = PortfolioManagerPrompt::build(
-            &state.company_of_interest,
-            &state.trade_date,
-            &state.market_report,
-            &state.sentiment_report,
-            &state.news_report,
-            &state.fundamentals_report,
-            &state.investment_plan,
-            &state.trader_investment_plan,
-            &risk.history,
-            &state.past_context,   // 注入历史交易记忆！
-        );
+AIMessage {
+    id: UUID
+    content: string?                      // None 时表示仅 tool_calls
+    tool_calls: List<ToolCall>?
+    additional_kwargs: Map<string, any>   // 存储 reasoning_content 等
+}
 
-        let messages = vec![Message::System { content: prompt }];
+ToolMessage {
+    id: UUID
+    name: string
+    content: string
+    tool_call_id: string
+}
 
-        // 结构化输出
-        let decision: PortfolioDecision = invoke_structured_or_freetext(
-            &*llm.deep, &*llm.deep, &messages, "portfolio_decision", "PortfolioManager",
-        ).await?;
+ToolCall {
+    id: string
+    type: "function"
+    function: FunctionCall
+}
 
-        state.final_trade_decision = decision.render();
-        let mut new_risk = risk.clone();
-        new_risk.judge_decision = decision.render();
-        state.risk_debate_state = new_risk;
-        state.sender = "Portfolio Manager".into();
-
-        Ok(())
-    }
+FunctionCall {
+    name: string
+    arguments: string                     // JSON string
 }
 ```
 
-### 信号提取
+### 4.3 评级枚举
 
-Portfolio Manager 输出 markdown 后，需要从中提取 5 级评级（Buy/Overweight/Hold/Underweight/Sell）。Python 版用正则启发式：
+```
+PortfolioRating: Buy | Overweight | Hold | Underweight | Sell
+TraderAction:    Buy | Hold | Sell
+```
 
-```rust
-/// 从 markdown 文本中提取 PortfolioRating（启发式正则匹配）
-pub fn extract_rating(text: &str) -> Option<PortfolioRating> {
-    // 1. 先找 "**Rating**: Buy" 这样的结构化字段
-    let re = Regex::new(r"\*\*Rating\*\*:\s*(\w+)").unwrap();
-    if let Some(caps) = re.captures(text) {
-        return PortfolioRating::from_str(&caps[1]).ok();
-    }
+### 4.4 工具定义类型
 
-    // 2. 找不到就用全文关键词搜索
-    let text_lower = text.to_lowercase();
-    if text_lower.contains("buy") { return Some(PortfolioRating::Buy); }
-    if text_lower.contains("overweight") { return Some(PortfolioRating::Overweight); }
-    if text_lower.contains("sell") { return Some(PortfolioRating::Sell); }
-    if text_lower.contains("underweight") { return Some(PortfolioRating::Underweight); }
-    if text_lower.contains("hold") { return Some(PortfolioRating::Hold); }
+```
+ToolDef {
+    name: string
+    description: string
+    parameters: JsonSchema               // JSON Schema 对象
+}
+```
 
-    None
+### 4.5 记忆日志条目
+
+```
+MemoryLogEntry {
+    date: Date
+    ticker: string
+    rating: PortfolioRating?
+    pending: bool
+    raw_return: float?
+    alpha_return: float?
+    holding_days: int?
+    decision: string                      // 完整 Markdown
+    reflection: string?                   // None = pending
 }
 ```
 
 ---
 
-## Checkpoint / 断点续跑
+## 5. 接口契约
 
-Python 版依赖 LangGraph 的 `SqliteSaver` 在每个节点执行完毕后自动保存。Rust 版需要手动实现——但逻辑非常简单。
+### 5.1 图执行引擎
 
-### 设计
-
-```rust
-use rusqlite::Connection;
-
-pub struct Checkpointer {
-    db: Connection,
-    thread_id: String,
+```
+interface GraphNode {
+    name(): string
+    stage(): PipelineStage
+    execute(state: &mut AgentState, llm: &LlmPair): Future<Result<()>>
 }
 
-impl Checkpointer {
-    /// 打开/创建 checkpoint 数据库
-    pub fn new(db_path: &str, ticker: &str, date: &str) -> Result<Self> {
-        let db = Connection::open(db_path)?;
+interface ConditionRouter {
+    route(state: &AgentState, config: &Config): PipelineStage
+}
 
-        db.execute_batch("
-            CREATE TABLE IF NOT EXISTS checkpoints (
-                thread_id TEXT NOT NULL,
-                stage TEXT NOT NULL,
-                state_json TEXT NOT NULL,
-                created_at TEXT DEFAULT (datetime('now')),
-                PRIMARY KEY (thread_id)
-            );
-        ")?;
-
-        let thread_id = generate_thread_id(ticker, date);
-
-        Ok(Self { db, thread_id })
-    }
-
-    /// 生成确定性 thread_id（SHA256 前16位）
-    fn thread_id(&self) -> &str { &self.thread_id }
-
-    /// 保存当前状态
-    pub async fn save(&self, stage: PipelineStage, state: &AgentState) -> Result<()> {
-        let json = serde_json::to_string(state)?;
-        self.db.execute(
-            "INSERT OR REPLACE INTO checkpoints (thread_id, stage, state_json) VALUES (?1, ?2, ?3)",
-            rusqlite::params![self.thread_id, serde_json::to_string(&stage)?, json],
-        )?;
-        Ok(())
-    }
-
-    /// 获取当前阶段（用于断点续跑）
-    pub fn get_current_stage(&self) -> Option<PipelineStage> {
-        self.db.query_row(
-            "SELECT stage FROM checkpoints WHERE thread_id = ?1",
-            rusqlite::params![self.thread_id],
-            |row| {
-                let s: String = row.get(0)?;
-                Ok(serde_json::from_str(&s).unwrap())
-            },
-        ).ok()
-    }
-
-    /// 加载保存的状态
-    pub fn load_state(&self) -> Option<AgentState> {
-        self.db.query_row(
-            "SELECT state_json FROM checkpoints WHERE thread_id = ?1",
-            rusqlite::params![self.thread_id],
-            |row| {
-                let json: String = row.get(0)?;
-                Ok(serde_json::from_str(&json).unwrap())
-            },
-        ).ok()
-    }
-
-    /// 是否存在 checkpoint（即是否可以从断点续跑）
-    pub fn has_checkpoint(&self) -> bool {
-        self.get_current_stage().is_some()
-    }
-
-    /// 运行完成后删除 checkpoint
-    pub fn clear(&self) -> Result<()> {
-        self.db.execute(
-            "DELETE FROM checkpoints WHERE thread_id = ?1",
-            rusqlite::params![self.thread_id],
-        )?;
-        Ok(())
-    }
+interface GraphExecutor {
+    stream(initial_state: AgentState): Stream<AgentState>
+    invoke(initial_state: AgentState): Future<Result<AgentState>>
 }
 ```
 
-### 使用方式
+### 5.2 LLM 客户端
 
-```rust
-pub async fn propagate(
-    ticker: &str,
-    date: &str,
-    config: &Config,
-) -> Result<(AgentState, PortfolioRating)> {
-    let llm = LlmPair::from_config(config);
+```
+interface LlmClient {
+    chat(messages: List<Message>): Future<Result<Message>>
+    chat_with_tools(messages: List<Message>, tools: List<ToolDef>): Future<Result<Message>>
+    chat_structured<T>(messages: List<Message>, schema: JsonSchema): Future<Result<T>>
+    validate_model(): bool
+    model_name(): string
+    provider_name(): string
+}
 
-    let checkpointer = if config.checkpoint_enabled {
-        let path = format!("{}/checkpoints/{}.db", config.data_cache_dir, ticker);
-        Some(Checkpointer::new(&path, ticker, date)?)
-    } else {
-        None
-    };
+struct LlmResponse {
+    content: string?
+    tool_calls: List<ToolCall>?
+    token_usage: TokenUsage
+    finish_reason: string
+}
 
-    // 尝试从 checkpoint 恢复
-    let mut state = if let Some(ref cp) = checkpointer {
-        if cp.has_checkpoint() {
-            cp.load_state().unwrap_or_else(|| Propagator::initial_state(ticker, date, config))
-        } else {
-            Propagator::initial_state(ticker, date, config)
-        }
-    } else {
-        Propagator::initial_state(ticker, date, config)
-    };
-
-    // 运行流水线
-    let decision = run_pipeline(&mut state, &llm, config, &checkpointer).await?;
-
-    // 成功后清除 checkpoint
-    if let Some(cp) = &checkpointer {
-        cp.clear()?;
-    }
-
-    // 存储决策到 Memory Log
-    MemoryLog::store_decision(ticker, date, &decision)?;
-
-    Ok((state, decision.rating))
+struct TokenUsage {
+    input_tokens: int
+    output_tokens: int
 }
 ```
 
-### 与 Python 版的关键差异
+### 5.3 数据源
 
-Python 版的 checkpoint 由 LangGraph 在每个节点执行完后**自动触发**。Rust 版需要我们在 `run_pipeline()` 中每个节点后**手动调用** `cp.save()`。但好在流程是硬编码的，所以不会遗漏。
-
-对于 `interrupt_before`（人工审核暂停）功能，可以加一个需要在某阶段前暂停的 flag：
-
-```rust
-pub async fn run_pipeline(
-    state: &mut AgentState,
-    llm: &LlmPair,
-    config: &Config,
-    checkpointer: &Option<Checkpointer>,
-) -> Result<PortfolioDecision> {
-    let start_stage = /* 恢复逻辑 */;
-    let nodes = build_nodes(config);
-
-    let mut stage = start_stage;
-    while stage != PipelineStage::Done {
-        // 如果配置了 interrupt_before 且当前阶段在列表中，暂停并返回
-        if config.interrupt_before.contains(&stage) {
-            log::info!("Interrupted before {:?}. Resume by calling propagate() again.", stage);
-            return Err(anyhow::anyhow!("Interrupted before {:?}", stage));
-        }
-
-        let node = nodes.iter().find(|n| n.stage() == stage).unwrap();
-        node.execute(state, llm).await?;
-
-        if let Some(cp) = checkpointer {
-            cp.save(stage, state).await?;
-        }
-
-        stage = next_stage(stage, state, config);
-    }
-
-    // ...
+```
+interface DataSource {
+    get_stock_data(symbol, start_date, end_date): Future<Result<string>>
+    get_indicators(symbol, indicator, curr_date, lookback_days): Future<Result<string>>
+    get_fundamentals(ticker, curr_date): Future<Result<string>>
+    get_balance_sheet(ticker, freq, curr_date): Future<Result<string>>
+    get_cashflow(ticker, freq, curr_date): Future<Result<string>>
+    get_income_statement(ticker, freq, curr_date): Future<Result<string>>
+    get_news(ticker, start_date, end_date): Future<Result<string>>
+    get_global_news(curr_date, lookback_days, limit): Future<Result<string>>
+    get_insider_transactions(ticker): Future<Result<string>>
 }
 ```
 
-这样，调用方在 `propagate()` 返回 `Interrupted` 错误后，可以人工检查 state 后再调用一次 `propagate()`——checkpoint 机制保证它从断点继续。
+### 5.4 记忆日志
 
----
-
-## Memory / 反思系统
-
-### 数据结构
-
-```rust
-use chrono::NaiveDate;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MemoryEntry {
-    pub date: NaiveDate,
-    pub ticker: String,
-    pub rating: Option<PortfolioRating>,   // None = pending
-    pub raw_return: Option<f64>,
-    pub alpha_return: Option<f64>,
-    pub holding_days: Option<i32>,
-    pub decision: String,                   // PortfolioDecision 的 markdown
-    pub reflection: Option<String>,         // None = pending
-}
-
-pub struct MemoryLog {
-    path: PathBuf,
-}
 ```
-
-### 核心逻辑
-
-```rust
-impl MemoryLog {
-    /// 追加一条 pending 决策
-    pub fn store_decision(
-        ticker: &str,
-        date: &str,
-        decision: &PortfolioDecision,
-    ) -> Result<()> {
-        let mut log = Self::load()?;
-
-        // 幂等性：如果已有同 ticker+date 的 pending 条目，跳过
-        let already_exists = log.iter().any(|e|
-            e.ticker == ticker && e.date.to_string() == date && e.rating.is_none()
-        );
-        if already_exists {
-            return Ok(());
-        }
-
-        log.push(MemoryEntry {
-            date: NaiveDate::parse_from_str(date, "%Y-%m-%d")?,
-            ticker: ticker.to_string(),
-            rating: None,
-            raw_return: None,
-            alpha_return: None,
-            holding_days: None,
-            decision: decision.render(),
-            reflection: None,
-        });
-
-        Self::save(&log)?;
-        Ok(())
-    }
-
-    /// 解析 pending 条目——获取真实收益，生成反思
-    pub async fn resolve_pending(ticker: &str, reflector: &Reflector, llm: &dyn LlmClient) -> Result<()> {
-        let mut log = Self::load()?;
-
-        for entry in log.iter_mut().filter(|e| e.ticker == ticker && e.rating.is_none()) {
-            // 获取实际收益（用 yfinance 或其他数据源）
-            let (raw_return, alpha_return) = fetch_actual_returns(
-                &entry.ticker,
-                &entry.date.to_string(),
-                entry.holding_days.unwrap_or(30),
-            ).await?;
-
-            // 生成反思
-            let reflection = reflector.reflect(
-                &entry.decision,
-                raw_return,
-                alpha_return,
-                &entry.date.to_string(),
-                llm,
-            ).await?;
-
-            entry.raw_return = Some(raw_return);
-            entry.alpha_return = Some(alpha_return);
-            entry.reflection = Some(reflection);
-        }
-
-        Self::save(&log)?;
-        Ok(())
-    }
-
-    /// 获取过往上下文（注入到 PortfolioManager prompt）
-    pub fn get_past_context(
-        ticker: &str,
-        n_same: usize,   // 最多 5 条同 ticker
-        n_cross: usize,  // 最多 3 条跨 ticker
-    ) -> Result<String> {
-        let log = Self::load()?;
-
-        let resolved: Vec<&MemoryEntry> = log.iter()
-            .filter(|e| e.rating.is_some() && e.reflection.is_some())
-            .collect();
-
-        let same_ticker: Vec<_> = resolved.iter()
-            .filter(|e| e.ticker == ticker)
-            .take(n_same)
-            .collect();
-
-        let cross_ticker: Vec<_> = resolved.iter()
-            .filter(|e| e.ticker != ticker)
-            .take(n_cross)
-            .collect();
-
-        let mut ctx = String::new();
-
-        for e in &same_ticker {
-            ctx.push_str(&format!(
-                "[{} | {} | {} | {:.2}% | {:.2}% | {}d]\n\nDECISION:\n{}\n\nREFLECTION:\n{}\n\n---\n\n",
-                e.date, e.ticker,
-                e.rating.as_ref().map(|r| format!("{:?}", r)).unwrap_or_default(),
-                e.raw_return.unwrap_or(0.0) * 100.0,
-                e.alpha_return.unwrap_or(0.0) * 100.0,
-                e.holding_days.unwrap_or(0),
-                e.decision,
-                e.reflection.as_deref().unwrap_or(""),
-            ));
-        }
-
-        for e in &cross_ticker {
-            ctx.push_str(&format!(
-                "[{} | {} | {} | {:.2}%]\n\nREFLECTION:\n{}\n\n---\n\n",
-                e.date, e.ticker,
-                e.rating.as_ref().map(|r| format!("{:?}", r)).unwrap_or_default(),
-                e.alpha_return.unwrap_or(0.0) * 100.0,
-                e.reflection.as_deref().unwrap_or(""),
-            ));
-        }
-
-        Ok(ctx)
-    }
-}
-```
-
-### Reflector
-
-```rust
-pub struct Reflector;
-
-impl Reflector {
-    pub async fn reflect(
-        &self,
-        decision: &str,
-        raw_return: f64,
-        alpha_return: f64,
-        date: &str,
-        llm: &dyn LlmClient,
-    ) -> Result<String> {
-        let prompt = format!(
-            "You are a trading performance reviewer.\n\n\
-             Decision on {}:\n{}\n\n\
-             Raw return: {:.2}%, Alpha vs SPY: {:.2}%\n\n\
-             Write a concise 2-4 sentence reflection on:\n\
-             1. Was the directional call correct?\n\
-             2. What held or failed in the investment thesis?\n\
-             3. One concrete lesson for next time.\n\n\
-             Reflection:",
-            date, decision, raw_return * 100.0, alpha_return * 100.0,
-        );
-
-        let messages = vec![Message::Human { content: prompt }];
-        let response = llm.chat(&messages).await?;
-        Ok(response.content.unwrap_or_default())
-    }
+interface MemoryLog {
+    store_decision(ticker, date, decision: PortfolioDecision): Result<()>
+    get_pending_entries(ticker): List<MemoryLogEntry>
+    batch_update_with_outcomes(updates: List<OutcomeUpdate>): Result<()>
+    get_past_context(ticker, n_same=5, n_cross=3): string
+    load_entries(): List<MemoryLogEntry>
 }
 ```
 
 ---
 
-## 数据供应商抽象
+## 6. 非功能性需求
 
-Python 版支持 yfinance 和 Alpha Vantage，带 fallback chain。Rust 版简化——优先用 yfinance（通过 HTTP 调用 Yahoo Finance API 或用 `yahoo_finance` crate），也可配 Alpha Vantage。
+### 6.1 性能
 
-```rust
-#[async_trait]
-pub trait DataVendor: Send + Sync {
-    async fn get_stock_data(&self, ticker: &str, start: &str, end: &str) -> Result<String>;
-    async fn get_indicators(&self, ticker: &str, start: &str, end: &str, indicators: &str) -> Result<String>;
-    async fn get_fundamentals(&self, ticker: &str) -> Result<String>;
-    async fn get_balance_sheet(&self, ticker: &str) -> Result<String>;
-    async fn get_cashflow(&self, ticker: &str) -> Result<String>;
-    async fn get_income_statement(&self, ticker: &str) -> Result<String>;
-    async fn get_news(&self, ticker: &str, start: &str, end: &str) -> Result<String>;
-    async fn get_global_news(&self, start: &str, end: &str) -> Result<String>;
-    async fn get_insider_transactions(&self, ticker: &str) -> Result<String>;
-}
+| 指标 | 目标 | 测量方法 |
+|------|------|----------|
+| 冷启动时间 | < 3s | 从程序启动到第一次 LLM 调用的时间 |
+| 单次分析延迟 | 取决于 LLM API，本地开销 < 5s | 排除 LLM API 调用和网络 I/O 的 CPU 时间 |
+| 内存占用 (空闲) | < 50MB | 程序启动后、开始分析前的 RSS |
+| 内存占用 (分析中) | < 200MB | 分析执行期间的峰值 RSS |
+| 并发分析 | 支持 ≥ 10 ticker 并行 | 无共享可变状态，独立 AgentState |
+| LLM Token 吞吐 | 不增加额外限制 | 不对 API 调用添加不必要的序列化屏障 |
 
-pub struct FallbackDataVendor {
-    primary: Box<dyn DataVendor>,
-    fallback: Box<dyn DataVendor>,
-}
+### 6.2 可靠性
 
-#[async_trait]
-impl DataVendor for FallbackDataVendor {
-    async fn get_stock_data(&self, ticker: &str, start: &str, end: &str) -> Result<String> {
-        match self.primary.get_stock_data(ticker, start, end).await {
-            Ok(data) => Ok(data),
-            Err(e) => {
-                log::warn!("Primary vendor failed ({e}), falling back");
-                self.fallback.get_stock_data(ticker, start, end).await
-            }
-        }
-    }
-    // ... 其他方法同理
-}
-```
+| 指标 | 目标 |
+|------|------|
+| LLM 调用失败处理 | 自动重试 3 次，指数退避 (1s, 2s, 4s) |
+| 数据源故障转移 | 主数据源失败自动切换备用 |
+| 检查点可靠性 | 节点失败后可恢复，最多丢失 1 个节点的进度 |
+| 日志写入可靠性 | 原子文件操作，崩溃不损坏日志 |
+| 优雅降级 | 结构化输出不可用时自动回退自由文本 |
 
-实际实现推荐直接调 Yahoo Finance 的 HTTP API（它是公开的），不需要额外的 Rust crate：
-- 历史数据：`https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?period1={start}&period2={end}&interval=1d`
-- 财报：`https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/{ticker}?type=annualIncomeStatementHistory`
+### 6.3 可维护性
 
----
+| 指标 | 目标 |
+|------|------|
+| 模块耦合度 | 智能体间通过 AgentState 共享数据，无直接依赖 |
+| 提示可更新性 | 提示模板修改不需要代码变更 |
+| 提供商扩展性 | 新增 LLM 提供商只需实现 LlmClient 接口 |
+| 数据源扩展性 | 新增数据供应商只需实现 DataSource 接口 |
+| 日志可观测性 | 结构化日志，支持不同级别（DEBUG/INFO/WARN/ERROR） |
+| 测试覆盖率 | 核心逻辑 ≥ 80%，解析器/工具 = 100% |
 
-## 配置系统
+### 6.4 兼容性
 
-```rust
-use serde::{Deserialize, Serialize};
+| 指标 | 目标 |
+|------|------|
+| 报告格式兼容 | 生成的 Markdown 报告结构与 Python 版本一致 |
+| 记忆日志兼容 | 能读取 Python 版本写入的 `trading_memory.md` |
+| 环境变量兼容 | 所有环境变量命名与 Python 版本一致 |
+| API 兼容 | （可选）提供与 Python 版 `TradingAgentsGraph` 兼容的编程接口 |
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
-    // LLM
-    pub llm_provider: Provider,
-    pub quick_think_model: String,
-    pub deep_think_model: String,
+### 6.5 分发性
 
-    // 分析师选择
-    pub selected_analysts: Vec<String>,
-
-    // 辩论轮数
-    pub max_debate_rounds: u32,
-    pub max_risk_discuss_rounds: u32,
-
-    // 工具/数据
-    pub data_vendor: String,          // "yfinance" | "alpha_vantage"
-    pub fallback_vendor: Option<String>,
-
-    // Checkpoint
-    pub checkpoint_enabled: bool,
-    pub data_cache_dir: String,
-
-    // 输出
-    pub output_language: String,
-    pub results_dir: String,
-
-    // 记忆
-    pub memory_log_enabled: bool,
-    pub memory_log_path: String,
-
-    // 人工审核
-    pub interrupt_before: Vec<PipelineStage>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            llm_provider: Provider::OpenAI,
-            quick_think_model: "gpt-4o".into(),
-            deep_think_model: "gpt-4o".into(),
-            selected_analysts: vec!["market".into(), "social".into(), "news".into(), "fundamentals".into()],
-            max_debate_rounds: 1,
-            max_risk_discuss_rounds: 1,
-            data_vendor: "yfinance".into(),
-            fallback_vendor: None,
-            checkpoint_enabled: false,
-            data_cache_dir: "~/.tradingagents/cache".into(),
-            output_language: "中文".into(),
-            results_dir: "~/.tradingagents/logs".into(),
-            memory_log_enabled: true,
-            memory_log_path: "~/.tradingagents/memory/trading_memory.md".into(),
-            interrupt_before: vec![],
-        }
-    }
-}
-```
+| 指标 | 目标 |
+|------|------|
+| 二进制大小 | < 50MB (release, stripped) |
+| 平台支持 | Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64) |
+| 外部依赖 | 无系统级依赖（SQLite 使用 bundled），不需要 Python 运行时 |
+| 安装方式 | 单二进制下载 + 解压即用 |
 
 ---
 
-## 完整代码骨架
+## 7. 安全需求
 
-```
-tradingagents-rs/
-├── Cargo.toml
-├── src/
-│   ├── main.rs                  # CLI 入口（clap）
-│   ├── config.rs                # 配置加载（toml/env）
-│   ├── pipeline.rs              # 硬编码的 run_pipeline() + next_stage()
-│   ├── state.rs                 # AgentState + 子状态 struct
-│   ├── message.rs               # Message enum + ToolCall + ToolDef
-│   ├── checkpoint.rs            # Checkpointer（SQLite）
-│   ├── memory.rs                # MemoryLog + MemoryEntry
-│   ├── reflection.rs            # Reflector
-│   ├── signal.rs                # extract_rating() 评级提取
-│   ├── llm/
-│   │   ├── mod.rs               # trait LlmClient + create_llm_client() factory
-│   │   ├── openai_compat.rs     # OpenAI-compatible client（8 个 provider 共用）
-│   │   ├── anthropic.rs         # Anthropic client
-│   │   └── google.rs            # Google Gemini client
-│   ├── tools/
-│   │   ├── mod.rs               # Tool + ToolRegistry
-│   │   ├── market.rs            # 注册市场数据工具
-│   │   ├── social.rs            # 注册社交媒体工具
-│   │   ├── news.rs              # 注册新闻工具
-│   │   └── fundamentals.rs      # 注册基本面工具
-│   ├── agents/
-│   │   ├── mod.rs               # trait GraphNode
-│   │   ├── analyst.rs           # AnalystNode（四个分析师共用）
-│   │   ├── bull_researcher.rs   # BullResearcherNode
-│   │   ├── bear_researcher.rs   # BearResearcherNode
-│   │   ├── research_manager.rs  # ResearchManagerNode
-│   │   ├── trader.rs            # TraderNode
-│   │   ├── aggressive_risk.rs   # AggressiveRiskNode
-│   │   ├── conservative_risk.rs # ConservativeRiskNode
-│   │   ├── neutral_risk.rs      # NeutralRiskNode
-│   │   └── portfolio_manager.rs # PortfolioManagerNode
-│   ├── data/
-│   │   ├── mod.rs               # trait DataVendor
-│   │   ├── yahoo.rs             # Yahoo Finance HTTP 调用
-│   │   └── alphavantage.rs      # Alpha Vantage API
-│   ├── schemas/
-│   │   └── mod.rs               # ResearchPlan, TraderProposal, PortfolioDecision
-│   └── prompts/                 # include_str!() 加载的 prompt 模板
-│       ├── market_analyst.md
-│       ├── social_media_analyst.md
-│       ├── news_analyst.md
-│       ├── fundamentals_analyst.md
-│       ├── bull_researcher.md
-│       ├── bear_researcher.md
-│       ├── research_manager.md
-│       ├── trader.md
-│       ├── aggressive_risk.md
-│       ├── conservative_risk.md
-│       ├── neutral_risk.md
-│       └── portfolio_manager.md
-└── tests/
-    ├── pipeline_test.rs
-    ├── checkpoint_test.rs
-    ├── memory_test.rs
-    └── signal_test.rs
-```
+### 7.1 路径安全
+
+- **SR-1.1**: ticker 值在用于文件系统路径前必须通过 `safe_ticker_component` 验证
+- **SR-1.2**: 允许字符集：`[A-Za-z0-9._\-\^]`
+- **SR-1.3**: 最大长度限制：32 字符
+- **SR-1.4**: 拒绝全点号值（如 `.`, `..`, `...`）
+- **SR-1.5**: 拒绝空字符串和非字符串类型
+
+### 7.2 输出安全
+
+- **SR-2.1**: HTML 报告中的 LLM 输出必须 HTML 转义
+- **SR-2.2**: Markdown 报告中的 LLM 输出不需要转义（纯文本）
+- **SR-2.3**: CLI 终端输出不需要额外转义
+
+### 7.3 敏感信息保护
+
+- **SR-3.1**: API Keys 不出现在任何日志输出中
+- **SR-3.2**: API Keys 不出现在错误消息中
+- **SR-3.3**: API Keys 不出现在导出的报告中
+- **SR-3.4**: 配置 dump 时必须屏蔽 `api_key` 字段
+- **SR-3.5**: `.env` 文件不应被提交到版本控制
+
+### 7.4 网络安全
+
+- **SR-4.1**: 所有 LLM API 调用必须使用 HTTPS
+- **SR-4.2**: TLS 证书验证必须启用（除非用户显式配置跳过）
+- **SR-4.3**: 支持企业代理配置
+
+### 7.5 输入验证
+
+- **SR-5.1**: 所有用户输入在用于 API 调用前进行验证
+- **SR-5.2**: 日期格式必须严格校验（YYYY-MM-DD，不能是未来日期）
+- **SR-5.3**: ticker 格式校验（拒绝含路径遍历字符的值）
+- **SR-5.4**: 工具调用参数必须进行基本类型校验
 
 ---
 
-## Python vs Rust 对照表
+## 8. 测试需求
 
-| 概念 | Python (LangChain/LangGraph) | Rust (本设计) |
-|------|---------------------------|--------------|
-| **LLM 调用** | `ChatOpenAI.invoke(messages)` | `llm.chat(&messages).await` |
-| **多 provider 支持** | LangChain 的 `Chat*` 类 | `trait LlmClient` + `create_llm_client()` factory |
-| **工具定义** | `@tool` 装饰器，自动推断 schema | `ToolRegistry::register()` 声明式注册 |
-| **工具循环** | LangGraph ToolNode + 条件边 | `agent_tool_loop()` 普通 while 循环 |
-| **结构化输出** | `llm.with_structured_output(PydanticModel)` | `llm.chat_structured::<T>(schema)` + JSON mode |
-| **状态管理** | LangGraph `MessagesState` + reducer | `AgentState` struct, 节点函数 `&mut state` |
-| **图调度** | LangGraph `StateGraph` 自动调度 | `run_pipeline()` + `next_stage()` 硬编码流程 |
-| **条件边** | `add_conditional_edges("node", router, mapping)` | `next_stage()` 中的 match + if 判断 |
-| **辩论循环** | 条件边自动 B 跳 | `next_stage()` 中 `count >= 2*max_rounds` 判断 |
-| **并行执行** | LangGraph 从 START 分叉自动并行 | 需要手动 `tokio::join!`（暂不需要，当前是顺序的） |
-| **Checkpoint** | LangGraph `SqliteSaver` 自动保存 | `Checkpointer::save()` 手动调，节点执行后保存 |
-| **断点续跑** | `graph.invoke(None, config)` | `cp.load_state()` + 从保存的 stage 继续 |
-| **消息历史** | MessagesState reducer 自动累加 | Analyst 节点结束时手动清空 `state.messages` |
-| **Prompt 模板** | `ChatPromptTemplate.from_messages()` | `str::replace("{var}", value)` |
-| **Memory Log** | 手写的 `TradingMemoryLog` | 同结构翻译为 Rust，追加式 markdown 文件 |
-| **Reflection** | `Reflector.reflect_on_final_decision()` | 同逻辑翻译，`llm.chat()` 调 LLM |
+### 8.1 测试层次
 
----
-
-## 关键简化点
-
-1. **没有通用的 DAG 调度器**：LangGraph 是一个通用的有向图执行框架，支持任意拓扑。TradingAgents 的图拓扑完全固定，所以用一个 `run_pipeline()` 函数 + `next_stage()` 路由函数就足够了。这比 LangGraph 简单一个数量级。
-
-2. **没有 Reducer 机制**：Python 的 `MessagesState` 有特殊的列表合并 reducer。Rust 不需要——我们手动管理 message 列表的追加和清空。
-
-3. **没有 LCEL**：`|` 管道符在 Rust 中没有等价物。但我们的节点逻辑足够简单（system prompt → LLM → 存结果），不需要管道组合。
-
-4. **没有 `@tool` 装饰器**：Rust 的 proc macro 可以实现类似效果，但过于复杂。声明式注册 `ToolRegistry` 足够。
-
-5. **并行执行被省略**：Python 版四个 Analyst 从 `START` 分叉后并行执行。但从日志看，实际配置中它们是**顺序**的（`sequential`），所以 Rust 版直接顺序执行。如果将来需要并行，用 `tokio::join!` 即可。
-
-6. **Prompt 模板极简化**：不需要 Jinja2。所有 prompt 是预写好的 markdown 文件，只有 `{ticker}`、`{date}` 等少数占位符需要替换。
-
----
-
-## 依赖（Cargo.toml 关键项）
-
-```toml
-[dependencies]
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-async-trait = "0.1"
-anyhow = "1"
-chrono = { version = "0.4", features = ["serde"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
-regex = "1"
-log = "0.4"
-clap = { version = "4", features = ["derive"] }
-toml = "0.8"
-
-[dev-dependencies]
-pretty_assertions = "1"
-mockito = "1"    # mock HTTP for testing LLM calls
-tempfile = "3"
 ```
+Layer 1 — 单元测试:
+  - 纯函数: parse_rating, safe_ticker_component, render_*, condition routers
+  - 类型转换: Message 序列化/反序列化
+  - 配置解析: Config 加载、合并、验证
+  - 记忆日志: 条目解析、格式化、轮换逻辑
+  - 信号提取: 各种 Markdown 格式变体
+
+Layer 2 — 集成测试:
+  - 图执行引擎: 使用 mock LLM + mock 数据源的完整图执行
+  - 数据源路由: 供应商选择、回退链
+  - 文件 I/O: 记忆日志读写、报告生成
+  - 检查点: SQLite 保存/恢复/清除
+  - 智能体协作: 多个智能体顺序执行的正确性
+
+Layer 3 — 端到端测试:
+  - 完整分析流程 (mock LLM 响应)
+  - CLI 参数解析和配置构建
+  - 完整分析流程 (真实 LLM，可选，CI 中不强制)
+```
+
+### 8.2 Mock 策略
+
+| Mock 对象 | 方式 |
+|-----------|------|
+| LLM 客户端 | 实现 `MockLlmClient`，返回预定义响应 |
+| 数据源 | 实现 `MockDataSource`，从 fixture 文件加载 |
+| 文件系统 | 使用 `tempfile` 创建临时目录 |
+| 网络 | 使用 mock HTTP server（如 `mockito`/`wiremock`） |
+| 时间 | 固定日期 `2026-05-14` |
+
+### 8.3 测试数据
+
+- 至少 5 个完整的 trader agents 输出样本（黄金数据集）
+- 至少 10 个评级提取测试用例（覆盖所有格式变体）
+- 至少 5 个记忆日志文件样本（含 pending 和 resolved 条目）
+- 至少 3 个配置文件样本（覆盖不同提供商和数据源组合）
+
+### 8.4 关键测试用例
+
+| 测试对象 | 最少测试数 | 覆盖场景 |
+|----------|----------|----------|
+| `parse_rating` | 20 | 所有格式变体 (bold, non-bold, colon, hyphen, case, position) |
+| `safe_ticker_component` | 15 | 合法值、路径遍历、特殊字符、长度限制、全点号 |
+| 条件路由逻辑 | 12 | 所有三种模式的边界条件 |
+| 结构化输出序列化 | 6 | 所有字段的组合（含 None 可选字段） |
+| 工具执行循环 | 5 | 0/1/多 次工具调用、工具错误、最大迭代 |
+| 记忆日志解析 | 10 | 完整/部分字段、pending/resolved、边界情况 |
+| 检查点 | 6 | 保存、恢复、覆盖、清除、多 ticker、空状态 |
+
+---
+
+## 9. 迁移约束
+
+### 9.1 必须保留的行为
+
+- **C-1.1**: 智能体执行顺序和依赖关系
+- **C-1.2**: 辩论循环的计数逻辑和终止条件
+- **C-1.3**: 结构化输出的 schema 结构和渲染格式
+- **C-1.4**: 记忆日志的文件格式和两阶段生命周期
+- **C-1.5**: 反思的三要点结构
+- **C-1.6**: 评级提取的双通道正则策略
+- **C-1.7**: 消息清理 + "Continue" 占位符的行为（Anthropic 兼容）
+- **C-1.8**: DeepSeek reasoning_content 回传逻辑
+
+### 9.2 允许的改进
+
+- 提示模板外置（从代码中分离到文件）
+- 增加更多 LLM 提供商或新模型
+- 改进错误消息的可读性
+- 增加细粒度的日志级别
+- 改进数据缓存策略
+- 增加对新型 LLM 功能（如 prompt caching）的支持
+
+### 9.3 不要求保留的
+
+- Python 特定的语法和模式（装饰器、动态类型等）
+- LangChain/LangGraph 的内部实现细节（仅保留外部行为）
+- `backtrader` 和 `redis` 依赖（未在核心流程中实际使用）
+- PyPI 包管理方式（改用目标语言的包管理）
+
+---
+
+## 10. 附录
+
+### 附录 A: Python 依赖分析
+
+| 依赖 | 是否核心 | 说明 |
+|------|---------|------|
+| `langgraph` | **核心** | 图编排引擎，需要完整重新实现 |
+| `langchain-core` | **核心** | 消息类型和工具定义，需重新实现 |
+| `langchain-openai` | **核心** | OpenAI LLM，需重新实现 HTTP 调用 |
+| `langchain-anthropic` | **核心** | Anthropic LLM，需重新实现 |
+| `langchain-google-genai` | **核心** | Google LLM，需重新实现 |
+| `langgraph-checkpoint-sqlite` | **核心** | SQLite 检查点，可用原生 SQLite 库替代 |
+| `yfinance` | **核心** | Yahoo Finance 数据，需重新实现 HTTP 调用 |
+| `stockstats` | **核心** | 技术指标计算，需找等价库或自行实现 |
+| `pandas` | **核心** | CSV 数据处理，可用轻量级 CSV 库替代 |
+| `typer` + `rich` | **核心** | CLI 界面，需找等价 CLI 框架 |
+| `pydantic` | **核心** | 数据验证/序列化，使用目标语言等价物 |
+| `markdown` | 重要 | Markdown → HTML 转换 |
+| `backtrader` | 非核心 | 回测框架（代码中未实际使用） |
+| `redis` | 非核心 | 缓存（代码中未实际使用） |
+| `parsel` | 非核心 | HTML 解析（代码中未实际使用） |
+
+### 附录 B: Python 源文件清单（按功能模块）
+
+```
+图编排层 (graph/):
+  trading_graph.py    — 主编排器: 初始化、执行、状态日志、记忆日志
+  setup.py            — 图构建: 创建节点、添加边、编译图
+  conditional_logic.py — 条件路由: 工具循环 + 辩论循环
+  propagation.py      — 初始状态创建 + 图参数
+  checkpointer.py     — SQLite 检查点: 保存/恢复/清除
+  reflection.py       — 事后反思 LLM 调用
+  signal_processing.py — 信号提取 (5-tier 评级)
+
+智能体层 (agents/):
+  analysts/market_analyst.py        — 市场技术分析师 + 工具循环
+  analysts/social_media_analyst.py  — 社交媒体情绪分析师
+  analysts/news_analyst.py          — 新闻分析师
+  analysts/fundamentals_analyst.py  — 基本面分析师
+  researchers/bull_researcher.py    — 牛市研究员 (辩论)
+  researchers/bear_researcher.py    — 熊市研究员 (辩论)
+  managers/research_manager.py      — 研究经理 (结构化输出)
+  trader/trader.py                  — 交易员 (结构化输出)
+  risk_mgmt/aggressive_debator.py   — 激进风险分析师
+  risk_mgmt/conservative_debator.py — 保守风险分析师
+  risk_mgmt/neutral_debator.py      — 中性风险分析师
+  managers/portfolio_manager.py     — 投资组合经理 (最终决策)
+
+通用层:
+  schemas.py           — Pydantic 结构化输出模式
+  utils/agent_states.py — AgentState + 子状态定义
+  utils/agent_utils.py  — 工具导入、消息删除、ticker 处理
+  utils/memory.py       — 决策记忆日志
+  utils/rating.py       — 评级解析 (正则启发式)
+  utils/structured.py   — 结构化输出 wrapper + 降级逻辑
+  utils/core_stock_tools.py        — 行情工具
+  utils/technical_indicators_tools.py — 指标工具
+  utils/fundamental_data_tools.py  — 基本面工具
+  utils/news_data_tools.py         — 新闻工具
+
+LLM 客户端层 (llm_clients/):
+  base_client.py       — 抽象基类 + 内容规范化
+  factory.py           — 工厂函数 (延迟导入)
+  openai_client.py     — OpenAI + 6 兼容提供商 + DeepSeek
+  anthropic_client.py  — Anthropic Claude
+  google_client.py     — Google Gemini
+  azure_client.py      — Azure OpenAI
+  model_catalog.py     — 已知模型列表
+  validators.py        — 模型验证
+
+数据源层 (dataflows/):
+  interface.py         — 供应商路由 + 回退链
+  config.py            — 运行时配置单例
+  y_finance.py         — yfinance OHLCV/指标/基本面/财报
+  yfinance_news.py     — yfinance 新闻
+  stockstats_utils.py  — 技术指标计算 + 缓存
+  alpha_vantage_*.py   — Alpha Vantage 实现 (6个文件)
+  utils.py             — ticker 安全验证 + 日期工具
+
+CLI 层 (cli/):
+  main.py              — Typer 应用 + Rich UI Live 显示
+  utils.py             — 交互式提示 + 提供商选择
+  models.py            — AnalystType 枚举
+  stats_handler.py     — LangChain 回调 (统计收集)
+  config.py            — CLI 配置常量
+  announcements.py     — 公告获取
+
+测试层 (tests/):
+  conftest.py                  — Fixtures (mock API keys, mock LLM)
+  test_signal_processing.py    — 信号提取测试
+  test_memory_log.py           — 记忆日志测试
+  test_structured_agents.py    — 结构化输出智能体测试
+  test_checkpoint_resume.py    — 断点续跑测试
+  test_deepseek_reasoning.py   — DeepSeek 特性测试
+  test_google_api_key.py       — Google API key 测试
+  test_model_validation.py     — 模型验证测试
+  test_safe_ticker_component.py — 安全 ticker 测试
+  test_ticker_symbol_handling.py — ticker 处理测试
+```
+
+### 附录 C: 文件大小估算 (Python 源码)
+
+| 模块 | 文件数 | 预估行数 |
+|------|--------|----------|
+| 图编排层 | 7 | ~600 |
+| 智能体 (含 schemas/utils) | 20 | ~1800 |
+| LLM 客户端 | 9 | ~800 |
+| 数据源 | 14 | ~1500 |
+| CLI | 6 | ~1400 |
+| 测试 | 10 | ~1500 |
+| **总计** | **~66** | **~7600** |
+
+### 附录 D: 术语对照表
+
+| Python 术语 | 通用概念 | 说明 |
+|-------------|---------|------|
+| LangGraph StateGraph | 有向状态图 | 节点 + 边构成的工作流图 |
+| ToolNode | 工具执行器 | 接收 tool_calls 执行对应函数 |
+| conditional_edges | 条件路由 | 根据状态值选择下一个节点 |
+| MessagesState | 消息列表状态 | 带有累加规则的状态类型 |
+| TypedDict | 类型化字典 | 键值对集合，有类型约束 |
+| @tool 装饰器 | 工具注册 | 将函数注册为 LLM 可调用的工具 |
+| with_structured_output | 结构化输出绑定 | 将 JSON Schema 绑定到 LLM |
+| ChatPromptTemplate | 提示模板 | 带变量插值的消息模板 |
+| SqliteSaver | SQLite 检查点存储 | 将状态持久化到 SQLite |
+| stream_mode="values" | 流式执行模式 | 每节点完成后输出完整状态 |
+| recursion_limit | 递归深度限制 | 防止无限循环的保护机制 |
+| Phase A / Phase B | 两阶段日志 | 先存储 pending，后解析结果 |
+
+---
+
+> **文档版本**: 1.0
+> **最后更新**: 2026-05-14
+> **基准代码版本**: TradingAgents v0.2.4
+>
+> 本文档基于对 TradingAgents 源代码的完整阅读和分析编写，覆盖了全部 ~66 个 Python 源文件的功能需求。

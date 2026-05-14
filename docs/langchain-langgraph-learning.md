@@ -9,16 +9,23 @@
 1. [为什么要用 LangChain？](#为什么要用-langchain)
 2. [LangChain 基础：LLM 调用三板斧](#langchain-基础llm-调用三板斧)
 3. [LCEL：用管道串联你的逻辑](#lcel用管道串联你的逻辑)
-4. [Tool Calling：让 LLM 能动手做事](#tool-calling让-llm-能动手做事)
-5. [Structured Output：让 LLM 输出格式化数据](#structured-output让-llm-输出格式化数据)
-6. [为什么要用 LangGraph？](#为什么要用-langgraph)
-7. [LangGraph 基础：有状态图](#langgraph-基础有状态图)
-8. [MessagesState：消息累加器](#messagesstate消息累加器)
-9. [条件边：动态路由](#条件边动态路由)
-10. [Agent 工具循环](#agent-工具循环)
-11. [多 Agent 协作](#多-agent-协作)
-12. [断点续跑](#断点续跑)
-13. [完整实战：构建一个股票分析 Agent](#完整实战构建一个股票分析-agent)
+4. [RunnablePassthrough & RunnableLambda：自定义管道环节](#runnablepassthrough--runnablelambda自定义管道环节)
+5. [Tool Calling：让 LLM 能动手做事](#tool-calling让-llm-能动手做事)
+6. [Structured Output：让 LLM 输出格式化数据](#structured-output让-llm-输出格式化数据)
+7. [流式输出：边生成边输出](#流式输出边生成边输出)
+8. [RAG 基础：让 LLM 能查资料](#rag-基础让-llm-能查资料)
+9. [为什么要用 LangGraph？](#为什么要用-langgraph)
+10. [LangGraph 基础：有状态图](#langgraph-基础有状态图)
+11. [MessagesState：消息累加器](#messagesstate消息累加器)
+12. [自定义 Reducer：不只是追加](#自定义-reducer不只是追加)
+13. [条件边：动态路由](#条件边动态路由)
+14. [Send API：动态并行分发](#send-api动态并行分发)
+15. [Agent 工具循环](#agent-工具循环)
+16. [Fallbacks & 错误处理：LLM 挂了怎么办](#fallbacks--错误处理llm-挂了怎么办)
+17. [多 Agent 协作](#多-agent-协作)
+18. [断点续跑](#断点续跑)
+19. [LangGraph 流式输出](#langgraph-流式输出)
+20. [完整实战：构建一个股票分析 Agent](#完整实战构建一个股票分析-agent)
 
 ---
 
@@ -173,6 +180,61 @@ chain.invoke({"question": "什么是 RAG？"})
 
 ---
 
+## RunnablePassthrough & RunnableLambda：自定义管道环节
+
+LCEL 的 `|` 要求每个环节都是 Runnable。如果某个环节只是一个普通函数，怎么办？
+
+### RunnableLambda：把函数变成管道环节
+
+```python
+from langchain_core.runnables import RunnableLambda
+
+def format_docs(docs: list) -> str:
+    """把文档列表拼接成字符串"""
+    return "\n\n".join(doc.page_content for doc in docs)
+
+# 包装后就能用 | 串联
+chain = retriever | RunnableLambda(format_docs) | prompt | llm
+```
+
+### RunnablePassthrough：透传数据
+
+管道中经常需要透传某些数据——不修改，只是往后传：
+
+```python
+from langchain_core.runnables import RunnablePassthrough
+
+# 典型用法：dict 中部分字段需要处理，部分字段直接透传
+chain = (
+    {
+        "context": retriever | format_docs,     # 这个字段走检索+格式化
+        "question": RunnablePassthrough(),       # 这个字段直接透传
+    }
+    | prompt | llm | StrOutputParser()
+)
+
+chain.invoke("什么是 RAG？")
+# prompt 收到: {"context": "文档内容...", "question": "什么是 RAG？"}
+```
+
+### RunnablePassthrough.assign()：往 dict 追加新字段
+
+```python
+answer_chain = prompt | llm | StrOutputParser()
+
+# assign：在原始输入 dict 基础上追加一个新 key
+full_chain = RunnablePassthrough.assign(answer=answer_chain)
+
+result = full_chain.invoke({"question": "什么是 RAG？"})
+# result == {"question": "什么是 RAG？", "answer": "RAG 是检索增强生成..."}
+```
+
+很适合**在保持原有信息的同时补全 LLM 计算结果**。
+
+> 一句话：`RunnableLambda` 让任何函数融入管道，`RunnablePassthrough` 让数据选择性透传，`assign` 在 dict 上追加计算结果。
+
+---
+
 ## Tool Calling：让 LLM 能动手做事
 
 LLM 本质上只能"说话"，不能查数据库、调 API、读文件。Tool Calling（函数调用）解决了这个问题：**LLM 告诉你它想调什么函数、传什么参数，由你（或框架）执行，然后把结果传回去。**
@@ -279,6 +341,100 @@ result = structured_llm.invoke("分析：这个产品太好用了")
 ```
 
 > 一句话：Structured Output 让 LLM 从"写作文"变成"填表格"，方便写代码处理。
+
+---
+
+## 流式输出：边生成边输出
+
+长回复如果等 LLM 全部生成完再显示，用户会觉得很慢。流式输出可以逐 token 输出，像 ChatGPT 的打字效果。
+
+### LLM 级别
+
+```python
+for chunk in llm.stream("用中文介绍 Python"):
+    print(chunk.content, end="", flush=True)
+```
+
+### Chain 级别
+
+LCEL chain 自动继承 `.stream()`——不需要任何额外配置：
+
+```python
+chain = prompt | llm | StrOutputParser()
+
+for chunk in chain.stream({"topic": "Python"}):
+    print(chunk, end="", flush=True)
+```
+
+### 异步流式
+
+```python
+async for chunk in chain.astream({"topic": "Python"}):
+    print(chunk, end="", flush=True)
+```
+
+### 流式 + Tool Calling
+
+当 LLM 调用工具时流式也正常工作——先流式输出 tool_calls 参数，工具执行完后继续流式输出最终回复。
+
+> 一句话：`.stream()` 让 LLM 打字机式输出，LCEL chain 自动继承这个能力，无需额外配置。
+
+---
+
+## RAG 基础：让 LLM 能查资料
+
+RAG（Retrieval Augmented Generation，检索增强生成）是 LangChain 的最大应用场景——**让 LLM 在回答前先查外部文档，用私有知识弥补训练数据的不足和时效性问题**。
+
+### 核心流程
+
+```
+文档加载 → 文本切分 → 向量化 → 存入向量库 → 检索 → 增强 prompt → LLM 生成
+```
+
+### 最小实现
+
+```python
+from langchain_community.document_loaders import TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+
+# 1. 加载 + 切分文档
+loader = TextLoader("knowledge.txt")
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+chunks = text_splitter.split_documents(loader.load())
+
+# 2. 向量化 + 存入向量库
+vectorstore = Chroma.from_documents(chunks, embedding=OpenAIEmbeddings())
+retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+
+# 3. RAG Chain —— 回顾上一节的 RunnablePassthrough
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "根据以下资料回答问题：\n\n{context}"),
+    ("human", "{question}"),
+])
+
+chain = (
+    {
+        "context": retriever | (lambda docs: "\n\n".join(d.page_content for d in docs)),
+        "question": RunnablePassthrough(),
+    }
+    | prompt | llm | StrOutputParser()
+)
+
+chain.invoke("公司去年的营收是多少？")
+```
+
+### 进阶方向
+
+- **多路检索**：从多个数据源同时检索，合并结果
+- **Query 改写**：把用户问题改写成更适合检索的形式
+- **Reranking**：对检索结果二次排序，提高相关性
+
+> 一句话：RAG = 检索 + 生成，先查资料再回答，让 LLM 的知识从"训练截止日"延伸到"你的私有文档"。
 
 ---
 
@@ -414,6 +570,56 @@ return {"messages": [AIMessage("数据拿到了，建议买入")]}
 
 ---
 
+## 自定义 Reducer：不只是追加
+
+MessagesState 的消息累加器本质上是 **reducer**——一个决定"新值如何合并到旧值"的函数。你可以用 `Annotated` 为任何字段自定义 reducer。
+
+### 语法
+
+```python
+from typing import Annotated
+from operator import add
+
+class MyState(TypedDict):
+    # add reducer：新列表追加到旧列表
+    history: Annotated[list, add]
+
+    # 默认行为（无 Annotated）：新值直接覆盖旧值
+    name: str
+
+    # 取最大值
+    max_score: Annotated[float, lambda current, update: max(current, update)]
+
+    # 取最新非空值
+    latest_report: Annotated[str, lambda current, update: update if update else current]
+
+    # 累加计数器
+    call_count: Annotated[int, lambda current, update: current + update]
+```
+
+### 执行逻辑
+
+当节点 `return {"max_score": 0.8}` 时，LangGraph 不直接覆盖，而是：
+
+```python
+# 内部：reducer(current=0.3, update=0.8) → 0.8
+new_max_score = reducer(0.3, 0.8)
+```
+
+### MessagesState 的秘密
+
+```python
+# MessagesState 本质上就是：
+class MessagesState(TypedDict):
+    messages: Annotated[list, add_messages]
+```
+
+`add_messages` 是内置的特殊 reducer——不仅追加消息，还会用消息 `id` 去重和替换同 ID 的旧消息（同名覆盖）。如果你只需要简单列表追加，用 `operator.add` 就够。
+
+> 一句话：`Annotated[类型, reducer函数]` 让你自定义每个字段的合并策略——追加、取最大、累加、只保留非空……全由你定。
+
+---
+
 ## 条件边：动态路由
 
 静态边是固定的 A → B。条件边是：**根据当前状态，决定下一步去哪**。
@@ -474,6 +680,56 @@ workflow.add_conditional_edges(
     }
 )
 ```
+
+---
+
+## Send API：动态并行分发
+
+条件边是"根据状态选一条路"（一对一路由）。但有时你需要"根据状态生成 N 条并行路"（一对多分发），每条路的输入还不一样。这就是 Send API 的用途。
+
+### 场景：同时分析多只股票
+
+```python
+from langgraph.types import Send
+
+class BatchState(TypedDict):
+    tickers: list[str]          # ["AAPL", "GOOGL", "TSLA"]
+    reports: Annotated[list, add]  # add reducer 收集所有报告
+
+def analyst(state):
+    """分析单只股票——ticker 来自 Send 传入的参数"""
+    ticker = state["ticker"]
+    return {"reports": [f"{ticker} 分析完成：建议买入"]}
+
+def fan_out(state) -> list[Send]:
+    """为每只股票生成一个 analyst 实例"""
+    return [Send("analyst", {"ticker": t}) for t in state["tickers"]]
+
+workflow.add_node("analyst", analyst)
+workflow.add_conditional_edges(START, fan_out, {"analyst": "analyst"})
+workflow.add_edge("analyst", END)
+```
+
+3 只股票 → 3 个 `analyst` 实例并行执行，各自拿到不同的 `ticker` 参数，结果自动用 `add` reducer 收集。
+
+### 与静态并行的对比
+
+| | 静态并行（多边） | Send API |
+|---|---|---|
+| 并行数 | 固定，编译时确定 | 动态，运行时由数据决定 |
+| 输入 | 所有实例共享同一个 state | 每个实例有独立参数 |
+| 适用场景 | 固定的分析师团队 | 按列表元素数量动态分叉 |
+
+```
+静态并行:                 Send API (map-reduce):
+  START                     START
+  ↓   ↓   ↓                 ↓ fan_out → 生成 N 个 Send
+  A   B   C                 ↓ analyst("AAPL") | analyst("GOOGL") | ...
+  ↓   ↓   ↓                 ↓ 结果自动用 add reducer 收集到 reports
+  汇总
+```
+
+> 一句话：Send API 实现 map-reduce 模式——运行时动态 fan-out 到 N 个并行实例，每个实例拿到不同参数。
 
 ---
 
@@ -566,6 +822,56 @@ result = graph.invoke({
 ```
 
 这就是 LangGraph 最核心的模式：**Agent 工具循环**。
+
+---
+
+## Fallbacks & 错误处理：LLM 挂了怎么办
+
+生产环境中，LLM 可能超时、限流、返回格式错误。LangChain 和 LangGraph 都提供了容错机制。
+
+### LangChain：模型级降级
+
+```python
+primary_llm = ChatOpenAI(model="gpt-4o", max_retries=2)
+backup_llm = ChatOpenAI(model="gpt-4o-mini")
+
+robust_llm = primary_llm.with_fallbacks([backup_llm])
+# gpt-4o 挂了 → 自动切到 gpt-4o-mini
+```
+
+`with_fallbacks` 返回一个新的 Runnable，按顺序尝试，第一个成功的返回结果。Chain 级别也可以用：
+
+```python
+chain = prompt | primary_llm.with_fallbacks([backup_llm]) | StrOutputParser()
+```
+
+### LangGraph：节点内 try/except
+
+```python
+def safe_agent(state: MessagesState) -> dict:
+    try:
+        response = llm_with_tools.invoke(state["messages"])
+    except Exception:
+        return {"messages": [AIMessage(content="抱歉，服务暂时不可用。")]}
+    return {"messages": [response]}
+```
+
+### ToolNode 自动重试
+
+```python
+from langgraph.prebuilt import ToolNode
+
+tools_node = ToolNode(tools, retry_on=[ConnectionError], max_retries=3)
+```
+
+### 关键原则
+
+- **模型降级**用 `with_fallbacks`——不影响图结构
+- **业务逻辑异常**用节点内 try/except——返回有意义的状态而非崩溃
+- **工具重试**用 ToolNode 的 `retry_on`——自动重试瞬态错误
+- **别吃掉所有异常**——只处理你能恢复的类型，让真正的 bug 暴露出来
+
+> 一句话：`with_fallbacks` 自动切备用模型，ToolNode `retry_on` 自动重试工具，节点 try/except 兜底——三层防护。
 
 ---
 
@@ -829,6 +1135,54 @@ with SqliteSaver.from_conn_string("checkpoints.db") as saver:
 
 ---
 
+## LangGraph 流式输出
+
+LangGraph 的 `.stream()` 支持多种流式模式，让你看到图内部正在发生什么。
+
+### 三种核心模式
+
+```python
+config = {"configurable": {"thread_id": "demo"}}
+
+# 模式1：values —— 每个节点执行后，输出完整的 state
+for event in graph.stream(input_data, config, stream_mode="values"):
+    print(event)  # 每个节点后输出完整 state
+
+# 模式2：updates —— 每个节点执行后，只输出该节点返回的增量
+for event in graph.stream(input_data, config, stream_mode="updates"):
+    print(event)  # {"analyst": {"messages": [AIMessage(...)]}}
+
+# 模式3：messages —— 输出 LLM token 流（打字机效果）
+for event in graph.stream(input_data, config, stream_mode="messages"):
+    # event = (AIMessageChunk, metadata)
+    print(event[0].content, end="", flush=True)
+```
+
+### 组合模式
+
+```python
+# 同时用两种模式——UI 更新用 updates，聊天窗口用 messages
+for event in graph.stream(input, config, stream_mode=["updates", "messages"]):
+    mode, data = event
+    if mode == "updates":
+        print(f"节点完成: {data}")
+    elif mode == "messages":
+        print(data[0].content, end="", flush=True)
+```
+
+### 模式对比
+
+| 模式 | 输出内容 | 用途 |
+|------|---------|------|
+| `values` | 完整 state | 调试、审计日志 |
+| `updates` | 节点返回的增量 | 跟踪节点进度 |
+| `messages` | LLM token 流 | 打字机效果、前端展示 |
+| `debug` | 详细执行信息 | 开发调试 |
+
+> 一句话：`stream_mode="messages"` 实现打字机效果，`stream_mode="updates"` 跟踪节点进度，两者可以组合使用。
+
+---
+
 ## 完整实战：构建一个股票分析 Agent
 
 把前面所有概念串起来，实现一个简化的股票分析 Agent。
@@ -980,15 +1334,23 @@ print(result.get("report", "无"))
 |------|----------|
 | **LangChain** | LLM 开发的"标准库"，统一调用接口、工具绑定、结构化输出 |
 | **LCEL** | `\|` 管道符，把 prompt / LLM / parser 串成流水线 |
+| **RunnablePassthrough** | 透传数据不改动，`.assign()` 在 dict 上追加新字段 |
+| **RunnableLambda** | 把普通函数包装成管道环节，融入 LCEL |
 | **@tool** | 装饰器，把普通函数变成 LLM 可调用的工具 |
 | **with_structured_output** | 让 LLM 输出 Pydantic 对象，不是纯文本 |
+| **.stream()** | 逐 token 流式输出，LCEL chain 自动继承 |
+| **RAG** | 检索增强生成：先查文档再回答，延伸 LLM 的知识边界 |
 | **LangGraph** | 用"有向图"建模 Agent 工作流，自动管理状态 |
 | **StateGraph** | 图 → 节点是步骤，边是流转方向 |
 | **MessagesState** | 带消息累加器的状态基类，多轮对话自动追加 |
+| **Annotated reducer** | `Annotated[类型, reducer]` 自定义每个字段的合并策略 |
 | **条件边** | 路由函数 `(state) -> str` 决定下一步去哪 |
+| **Send API** | 运行时动态生成 N 个并行节点实例，map-reduce 模式 |
 | **ToolNode** | 自动解析 LLM 的 tool_calls 并执行对应的 `@tool` 函数 |
 | **工具循环** | Agent ↔ ToolNode 循环，直到 LLM 不再要工具 |
+| **with_fallbacks** | 自动切备用模型，LLM 挂了不崩 |
 | **Checkpoint** | 自动保存状态，崩溃后从断点继续 |
+| **stream_mode** | LangGraph 流式输出：values/updates/messages 三种视角 |
 
 ---
 
