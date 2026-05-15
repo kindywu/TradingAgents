@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, String, DateTime, JSON, Text
+from sqlalchemy import Column, String, DateTime, JSON, Text, UniqueConstraint
 from app.models.base import Base
 
 
@@ -15,6 +15,9 @@ def _new_uuid():
 
 class AnalysisJob(Base):
     __tablename__ = "analysis_jobs"
+    __table_args__ = (
+        UniqueConstraint("ticker", "analysis_date", name="uq_ticker_date"),
+    )
 
     id = Column(String, primary_key=True, default=_new_uuid)
     ticker = Column(String, nullable=False, index=True)

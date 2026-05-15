@@ -1,5 +1,5 @@
 @host = http://localhost:8000
-@job_id = 5207f3a1-d6cc-4b57-a035-a934ac30a2de
+@job_id = 2d5bfe6e-a15e-4a06-8c05-d7bce8b55372
 
 
 ### health
@@ -12,7 +12,7 @@ POST {{host}}/api/v1/analysis
 Content-Type: application/json
 
 {
-  "ticker": "09988.HK",
+  "ticker": "9988.HK",
   "analysis_date": "2026-05-15",
   "analysts": ["market", "social", "news", "fundamentals"],
   "research_depth": 5,
@@ -35,4 +35,12 @@ GET {{host}}/api/v1/analysis/{{job_id}}/report HTTP/1.1
 
 ### stream progress (SSE)
 GET {{host}}/api/v1/analysis/{{job_id}}/stream HTTP/1.1
+
+
+### view report in browser (index.html)
+GET {{host}}/api/v1/analysis/{{job_id}}/view HTTP/1.1
+
+
+### view report file (e.g. market_analysis.html)
+GET {{host}}/api/v1/analysis/{{job_id}}/view/index.html HTTP/1.1
     

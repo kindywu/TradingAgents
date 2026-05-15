@@ -4,8 +4,10 @@ import queue
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import markdown
 from sqlalchemy.orm import Session
 
 from app.models.analysis import AnalysisJob
@@ -63,7 +65,22 @@ class AnalysisService:
         from app.db.session import SessionLocal
         return SessionLocal()
 
-    def start_analysis(self, db: Session, params: AnalysisRequest) -> str:
+    def start_analysis(self, db: Session, params: AnalysisRequest) -> tuple[str, str]:
+        """Start or retrieve an analysis job.
+
+        Returns (job_id, status) — status is "started" for new jobs,
+        "completed" for cached results, or "running" for in-progress jobs.
+        """
+        existing = (
+            db.query(AnalysisJob)
+            .filter(AnalysisJob.ticker == params.ticker)
+            .filter(AnalysisJob.analysis_date == params.analysis_date)
+            .first()
+        )
+
+        if existing is not None:
+            return existing.id, existing.status
+
         job = AnalysisJob(
             ticker=params.ticker,
             analysis_date=params.analysis_date,
@@ -84,7 +101,7 @@ class AnalysisService:
         )
         thread.start()
 
-        return job.id
+        return job.id, "started"
 
     def get_event_queue(self, job_id: str) -> queue.Queue:
         q = self._queues.get(job_id)
@@ -393,6 +410,11 @@ class AnalysisService:
         return str(content).strip() if not is_empty(content) else None
 
     def _save_result(self, job_id, params, report_sections, decision, stats_handler):
+        # Save report files to disk
+        report_dir = self._save_report_to_disk(
+            params.ticker, params.analysis_date, report_sections, decision
+        )
+
         db = self._new_session()
         try:
             job = db.query(AnalysisJob).filter(AnalysisJob.id == job_id).first()
@@ -404,6 +426,7 @@ class AnalysisService:
                     "decision": decision,
                     "report_sections": report_sections,
                     "stats": stats_handler.get_stats(),
+                    "report_dir": str(report_dir),
                 }
                 job.updated_at = _utc_now()
                 db.commit()
@@ -424,6 +447,136 @@ class AnalysisService:
             pass
         finally:
             db.close()
+
+    # ------------------------------------------------------------------
+    # Report file storage
+    # ------------------------------------------------------------------
+
+    _HTML_CSS = """\
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 2rem 1rem; line-height: 1.6; color: #1a1a1a; background: #fff; }
+        h1 { border-bottom: 2px solid #0366d6; padding-bottom: .3em; }
+        h2 { border-bottom: 1px solid #eaecef; padding-bottom: .3em; margin-top: 2em; }
+        h3 { margin-top: 1.5em; }
+        code { background: #f6f8fa; padding: .2em .4em; border-radius: 3px; font-size: 90%; }
+        pre { background: #f6f8fa; padding: 1em; border-radius: 6px; overflow-x: auto; }
+        pre code { background: none; padding: 0; }
+        table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+        th, td { border: 1px solid #dfe2e5; padding: .5em .8em; text-align: left; }
+        th { background: #f6f8fa; }
+        blockquote { border-left: 4px solid #0366d6; color: #555; padding-left: 1em; margin: 1em 0; }
+        a { color: #0366d6; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .nav { margin-bottom: 1.5em; font-size: .9em; }
+        .nav a { padding: .2em .5em; }
+        .toc { background: #f6f8fa; padding: 1em 2em; border-radius: 6px; margin: 1.5em 0; }
+        .toc ul { padding-left: 1.5em; }
+        .toc li { margin: .3em 0; }
+    """
+
+    @staticmethod
+    def _md_to_html(md_text: str, title: str = "", back_link: str | None = None) -> str:
+        body = markdown.markdown(md_text, extensions=["tables", "fenced_code"])
+        nav = f'<p class="nav"><a href="{back_link}">Back to Index</a></p>' if back_link else ""
+        return f"""\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+{AnalysisService._HTML_CSS}
+</style>
+</head>
+<body>
+{nav}
+<article>
+{body}
+</article>
+</body>
+</html>"""
+
+    @staticmethod
+    def _save_report_to_disk(ticker: str, analysis_date: str, report_sections: Dict[str, Optional[str]], decision: str) -> Path:
+        from tradingagents.default_config import DEFAULT_CONFIG
+
+        base_dir = Path(DEFAULT_CONFIG["results_dir"]) / ticker / analysis_date / "reports"
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        section_files = {
+            "market_report": ("market_analysis", "Market Analysis"),
+            "sentiment_report": ("sentiment", "Social Sentiment"),
+            "news_report": ("news", "News Analysis"),
+            "fundamentals_report": ("fundamentals", "Fundamentals Analysis"),
+            "investment_plan": ("research_decision", "Research Team Decision"),
+            "trader_investment_plan": ("trader_plan", "Trading Team Plan"),
+            "final_trade_decision": ("portfolio_decision", "Portfolio Management Decision"),
+        }
+
+        file_map: Dict[str, list] = {}
+        report_parts: list = []
+
+        for section_key, (filename, display_name) in section_files.items():
+            content = report_sections.get(section_key)
+            if not content:
+                continue
+
+            md_path = base_dir / f"{filename}.md"
+            html_path = base_dir / f"{filename}.html"
+
+            md_path.write_text(content, encoding="utf-8")
+            html = AnalysisService._md_to_html(content, title=display_name, back_link="index.html")
+            html_path.write_text(html, encoding="utf-8")
+
+            file_map[display_name] = [(display_name, f"{filename}.md", f"{filename}.html")]
+            report_parts.append(f"## {display_name}\n{content}")
+
+        # Complete report
+        header = f"# Trading Analysis Report: {ticker}\n\nAnalysis Date: {analysis_date}\nDecision: **{decision}**\n\n---\n\n"
+        complete_md = header + "\n\n".join(report_parts)
+        (base_dir / "complete_report.md").write_text(complete_md, encoding="utf-8")
+        html = AnalysisService._md_to_html(complete_md, title=f"Report: {ticker}", back_link="index.html")
+        (base_dir / "complete_report.html").write_text(html, encoding="utf-8")
+
+        # Index
+        AnalysisService._generate_index_html(base_dir, ticker, file_map)
+
+        return base_dir
+
+    @staticmethod
+    def _generate_index_html(save_path: Path, ticker: str, file_map: dict) -> None:
+        toc_items = []
+        for section_name, files in file_map.items():
+            toc_items.append(f'<h3>{section_name}</h3>')
+            toc_items.append('<ul>')
+            for label, md_file, html_file in files:
+                toc_items.append(f'<li><a href="{html_file}">{label}</a> (<a href="{md_file}">md</a>)</li>')
+            toc_items.append('</ul>')
+
+        body = f"""\
+<h1>Trading Analysis Report: {ticker}</h1>
+<p>Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}</p>
+<div class="toc">
+<h2>Contents</h2>
+{"".join(toc_items)}
+</div>
+"""
+        html = f"""\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trading Analysis Report: {ticker}</title>
+<style>
+{AnalysisService._HTML_CSS}
+</style>
+</head>
+<body>
+{body}
+</body>
+</html>"""
+        (save_path / "index.html").write_text(html, encoding="utf-8")
 
 
 # Singleton

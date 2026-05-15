@@ -1,9 +1,10 @@
 import asyncio
 import json
 import logging
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.dependencies import get_db
@@ -15,16 +16,21 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/analysis", tags=["analysis"])
 
 
-@router.post("", response_model=AnalysisResponse, status_code=202)
+@router.post("")
 def start_analysis(request: AnalysisRequest, db: Session = Depends(get_db)):
-    """Start a new trading analysis job. Returns job_id for tracking.
+    """Start a new trading analysis job.
 
-    Connect to GET /{job_id}/stream for real-time SSE progress events.
+    Returns job_id for tracking. If an analysis for the same ticker+date
+    already exists, returns the existing job (200). New jobs return 202.
     """
     if not request.analysts:
         raise HTTPException(status_code=400, detail="At least one analyst must be selected")
-    job_id = analysis_service.start_analysis(db, request)
-    return AnalysisResponse(job_id=job_id, status="started")
+    job_id, status = analysis_service.start_analysis(db, request)
+    http_status = 202 if status == "started" else 200
+    return JSONResponse(
+        content=AnalysisResponse(job_id=job_id, status=status).model_dump(),
+        status_code=http_status,
+    )
 
 
 @router.get("/{job_id}", response_model=JobStatus)
@@ -114,3 +120,36 @@ def get_report(job_id: str, db: Session = Depends(get_db)):
         report="\n\n".join(report_parts) if report_parts else None,
         sections=sections if sections else None,
     )
+
+
+@router.get("/{job_id}/view")
+def view_report(job_id: str, db: Session = Depends(get_db)):
+    """Serve the report index.html for a completed job."""
+    job = analysis_service.get_job(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.result is None:
+        raise HTTPException(status_code=404, detail="No report available")
+    report_dir = job.result.get("report_dir")
+    if not report_dir:
+        raise HTTPException(status_code=404, detail="Report directory not found")
+    return FileResponse(Path(report_dir) / "index.html")
+
+
+@router.get("/{job_id}/view/{path:path}")
+def view_report_file(job_id: str, path: str, db: Session = Depends(get_db)):
+    """Serve a static file from the report directory (html, md, etc.)."""
+    job = analysis_service.get_job(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.result is None:
+        raise HTTPException(status_code=404, detail="No report available")
+    report_dir = job.result.get("report_dir")
+    if not report_dir:
+        raise HTTPException(status_code=404, detail="Report directory not found")
+    file_path = Path(report_dir) / path
+    if not file_path.resolve().is_relative_to(Path(report_dir).resolve()):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path)
