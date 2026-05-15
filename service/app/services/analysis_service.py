@@ -498,9 +498,7 @@ class AnalysisService:
 
     @staticmethod
     def _save_report_to_disk(ticker: str, analysis_date: str, report_sections: Dict[str, Optional[str]], decision: str) -> Path:
-        from tradingagents.default_config import DEFAULT_CONFIG
-
-        base_dir = Path(DEFAULT_CONFIG["results_dir"]) / ticker / analysis_date / "reports"
+        base_dir = Path(__file__).resolve().parent.parent.parent / "reports" / ticker / analysis_date
         base_dir.mkdir(parents=True, exist_ok=True)
 
         section_files = {

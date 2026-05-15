@@ -136,12 +136,8 @@ def view_report(job_id: str, db: Session = Depends(get_db)):
     return FileResponse(Path(report_dir) / "index.html")
 
 
-@router.get("/{job_id}/view/{path:path}")
-def view_report_file(job_id: str, path: str, db: Session = Depends(get_db)):
-    """Serve a static file from the report directory (html, md, etc.)."""
-    job = analysis_service.get_job(db, job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job not found")
+def _serve_report_file(job, path: str):
+    """Serve a static file from the job's report directory."""
     if job.result is None:
         raise HTTPException(status_code=404, detail="No report available")
     report_dir = job.result.get("report_dir")
@@ -153,3 +149,21 @@ def view_report_file(job_id: str, path: str, db: Session = Depends(get_db)):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(file_path)
+
+
+@router.get("/{job_id}/view/{path:path}")
+def view_report_file(job_id: str, path: str, db: Session = Depends(get_db)):
+    """Serve a static file from the report directory."""
+    job = analysis_service.get_job(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _serve_report_file(job, path)
+
+
+@router.get("/{job_id}/{path:path}")
+def view_report_file_direct(job_id: str, path: str, db: Session = Depends(get_db)):
+    """Serve a static file from the report directory (short URL)."""
+    job = analysis_service.get_job(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _serve_report_file(job, path)
