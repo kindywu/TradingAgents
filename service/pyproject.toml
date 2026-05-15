@@ -1,0 +1,20 @@
+[project]
+name = "tradingagents-service"
+version = "0.1.0"
+description = "REST API service for TradingAgents multi-agent financial trading framework"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "sqlalchemy>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "pydantic>=2.0.0",
+    "aiofiles>=24.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=6.0.0",
+    "httpx>=0.28.0",
+]

@@ -1,0 +1,38 @@
+@host = http://localhost:8000
+@job_id = 5207f3a1-d6cc-4b57-a035-a934ac30a2de
+
+
+### health
+GET {{host}}/health HTTP/1.1
+
+
+### start analysis
+
+POST {{host}}/api/v1/analysis
+Content-Type: application/json
+
+{
+  "ticker": "09988.HK",
+  "analysis_date": "2026-05-15",
+  "analysts": ["market", "social", "news", "fundamentals"],
+  "research_depth": 5,
+  "llm_provider": "deepseek",
+  "shallow_thinker": "deepseek-v4-flash",
+  "deep_thinker": "deepseek-v4-pro",
+  "output_language": "English"
+}
+
+// research_depth: Shallow(1), Medium(3), Deep(5)
+
+
+### get job status
+GET {{host}}/api/v1/analysis/{{job_id}} HTTP/1.1
+
+
+### get report
+GET {{host}}/api/v1/analysis/{{job_id}}/report HTTP/1.1
+
+
+### stream progress (SSE)
+GET {{host}}/api/v1/analysis/{{job_id}}/stream HTTP/1.1
+    
