@@ -35,9 +35,9 @@
 
 ```python
 from openai import OpenAI
-client = OpenAI()
+client = OpenAI(api_key="your-api-key", base_url="https://api.deepseek.com/v1")
 response = client.chat.completions.create(
-    model="gpt-4o",
+    model="deepseek-chat",
     messages=[{"role": "user", "content": "你好"}],
 )
 print(response.choices[0].message.content)
@@ -67,11 +67,11 @@ from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 
 # 两个模型，用法完全一致
-llm_openai = ChatOpenAI(model="gpt-4o")
+llm_ds = ChatOpenAI(model="deepseek-chat", base_url="https://api.deepseek.com/v1")
 llm_claude = ChatAnthropic(model="claude-sonnet-4-6")
 
 # 统一调用
-result = llm_openai.invoke("你好")       # → AIMessage(content="你好！有什么可以帮你的？")
+result = llm_ds.invoke("你好")       # → AIMessage(content="你好！有什么可以帮你的？")
 result = llm_claude.invoke("你好")       # → AIMessage(content="你好！请问...")
 ```
 
@@ -769,7 +769,7 @@ def save_to_file(content: str, filename: str) -> str:
 tools = [search, save_to_file]
 
 # 2. 给 LLM 绑定工具
-llm = ChatOpenAI(model="gpt-4o")
+llm = ChatOpenAI(model="deepseek-chat", base_url="https://api.deepseek.com/v1")
 llm_with_tools = llm.bind_tools(tools)
 
 # 3. 核心节点：LLM 推理
@@ -832,11 +832,11 @@ result = graph.invoke({
 ### LangChain：模型级降级
 
 ```python
-primary_llm = ChatOpenAI(model="gpt-4o", max_retries=2)
-backup_llm = ChatOpenAI(model="gpt-4o-mini")
+primary_llm = ChatOpenAI(model="deepseek-chat", base_url="https://api.deepseek.com/v1", max_retries=2)
+backup_llm = ChatOpenAI(model="deepseek-v4-flash", base_url="https://api.deepseek.com/v1")
 
 robust_llm = primary_llm.with_fallbacks([backup_llm])
-# gpt-4o 挂了 → 自动切到 gpt-4o-mini
+# deepseek-chat 挂了 → 自动切到 deepseek-v4-flash
 ```
 
 `with_fallbacks` 返回一个新的 Runnable，按顺序尝试，第一个成功的返回结果。Chain 级别也可以用：
@@ -1253,7 +1253,7 @@ class StockAnalysisState(MessagesState):
 # 第3步：定义节点
 # ============================================================
 
-llm = ChatOpenAI(model="gpt-4o", temperature=0.1)
+llm = ChatOpenAI(model="deepseek-chat", base_url="https://api.deepseek.com/v1", temperature=0.1)
 llm_with_tools = llm.bind_tools(tools)
 
 def stock_analyst(state: StockAnalysisState) -> dict:

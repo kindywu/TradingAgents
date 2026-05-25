@@ -160,7 +160,7 @@ TradingAgents 是一个**多智能体 LLM 金融交易分析框架**。系统通
 ### 2.3 快速/深度模型分工
 
 ```
-quick_thinking_llm (快速模型, e.g. GPT-5.4-mini):
+quick_thinking_llm (快速模型, e.g. deepseek-chat):
   ├── Market Analyst
   ├── Social Media Analyst
   ├── News Analyst
@@ -173,7 +173,7 @@ quick_thinking_llm (快速模型, e.g. GPT-5.4-mini):
   ├── Neutral Risk Analyst
   └── Reflector (事后反思)
 
-deep_thinking_llm (深度模型, e.g. GPT-5.4):
+deep_thinking_llm (深度模型, e.g. deepseek-reasoner):
   ├── Research Manager
   └── Portfolio Manager
 ```
@@ -737,7 +737,7 @@ CLI 必须提供以下交互式输入步骤：
 | 3 | Output Language | 单选 | English | — |
 | 4 | Analyst Selection | 多选 | 全选 | 至少选一个 |
 | 5 | Research Depth | 单选 | Shallow (1 round) | — |
-| 6 | LLM Provider | 单选 | OpenAI | — |
+| 6 | LLM Provider | 单选 | DeepSeek | — |
 | 7 | Quick-thinking Model | 单选 | 提供商默认 | — |
 | 8 | Deep-thinking Model | 单选 | 提供商默认 | — |
 | 9 | Thinking Config | 单选 (条件) | 无 | 仅当提供商支持时显示 |
@@ -788,6 +788,16 @@ Options:
 - **FR-9.7.1**: 必须支持 Shell 自动补全
 - **FR-9.7.2**: 必须支持帮助命令 (`--help`)
 - **FR-9.7.3**: 支持非交互模式（直接传参数跳过交互式问答）
+
+#### FR-9.8 REST API 服务
+
+新增的 `service/` 目录提供 FastAPI REST API，将 TradingAgents 能力暴露为 HTTP 端点：
+
+- **FR-9.8.1**: 提供 `POST /api/v1/analysis` 提交分析任务，`GET /api/v1/analysis/{job_id}` 查询结果和状态，SSE 流式推送 `GET /api/v1/analysis/{job_id}/stream`
+- **FR-9.8.2**: 使用 SQLAlchemy ORM + SQLite 持久化分析任务记录
+- **FR-9.8.3**: Pydantic v2 模式进行请求/响应验证
+- **FR-9.8.4**: 报告输出 Markdown + HTML（带内嵌 CSS、响应式布局），可通过 `GET /api/v1/analysis/{job_id}/view` 浏览
+- **FR-9.8.5**: 健康检查端点 `GET /health`
 
 ---
 
@@ -1322,6 +1332,7 @@ Layer 3 — 端到端测试:
 - Python 特定的语法和模式（装饰器、动态类型等）
 - LangChain/LangGraph 的内部实现细节（仅保留外部行为）
 - `backtrader` 和 `redis` 依赖（未在核心流程中实际使用）
+- FastAPI/SQLAlchemy 的具体实现细节（保留 REST API 端点行为契约即可）
 - PyPI 包管理方式（改用目标语言的包管理）
 
 ---
@@ -1344,6 +1355,10 @@ Layer 3 — 端到端测试:
 | `typer` + `rich` | **核心** | CLI 界面，需找等价 CLI 框架 |
 | `pydantic` | **核心** | 数据验证/序列化，使用目标语言等价物 |
 | `markdown` | 重要 | Markdown → HTML 转换 |
+| `fastapi` | **核心** | REST API 框架 (service/)，需找等价框架 |
+| `sqlalchemy` | **核心** | ORM (service/)，需找等价或目标语言 ORM |
+| `uvicorn` | 重要 | ASGI 服务器 (service/)，可使用框架自带 |
+| `httpx` | 非核心 | API 测试客户端 |
 | `backtrader` | 非核心 | 回测框架（代码中未实际使用） |
 | `redis` | 非核心 | 缓存（代码中未实际使用） |
 | `parsel` | 非核心 | HTML 解析（代码中未实际使用） |
@@ -1413,6 +1428,18 @@ CLI 层 (cli/):
   config.py            — CLI 配置常量
   announcements.py     — 公告获取
 
+REST API 层 (service/):
+  app/main.py          — FastAPI 应用入口 + lifespan
+  app/config.py        — Pydantic Settings 配置单例
+  app/dependencies.py  — 依赖注入 (DB session)
+  app/db/session.py    — SQLAlchemy 引擎与 session factory
+  app/models/base.py   — declarative_base
+  app/models/analysis.py — 分析任务 ORM 模型
+  app/schemas/analysis.py — Pydantic 请求/响应模式
+  app/routers/health.py  — GET /health
+  app/routers/analysis.py — POST /analysis/, GET /analysis/{id}
+  app/services/analysis_service.py — 业务逻辑
+
 测试层 (tests/):
   conftest.py                  — Fixtures (mock API keys, mock LLM)
   test_signal_processing.py    — 信号提取测试
@@ -1435,8 +1462,9 @@ CLI 层 (cli/):
 | LLM 客户端 | 9 | ~800 |
 | 数据源 | 14 | ~1500 |
 | CLI | 6 | ~1400 |
+| REST API (service/) | 12 | ~800 |
 | 测试 | 10 | ~1500 |
-| **总计** | **~66** | **~7600** |
+| **总计** | **~78** | **~8400** |
 
 ### 附录 D: 术语对照表
 
